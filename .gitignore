@@ -175,3 +175,6 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+*.orig
+*.rej
+push-ksun-susfs.sh
