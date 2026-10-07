@@ -134,8 +134,8 @@ $(info -- KernelSU-Next version: $(KSU_VERSION))
 ccflags-y += -DKSU_VERSION=$(KSU_VERSION)
 else
 # If there is no .git directory, use default version
-# Vendored in-tree (no separate .git): hardcode to pershoot dev-susfs base (v3.4.0 @ d575262c, 30000+3312)
-KSU_VERSION_FALLBACK := 33312
+# Vendored in-tree (no separate .git): hardcode to pershoot dev-susfs base (v3.4.0 @ feb0f83b, 30000+3331)
+KSU_VERSION_FALLBACK := 33331
 $(info -- KernelSU-Next version fallback: $(KSU_VERSION_FALLBACK))
 ccflags-y += -DKSU_VERSION=$(KSU_VERSION_FALLBACK)
 endif
