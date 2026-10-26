@@ -1,0 +1,199 @@
+name: Build Asteroids Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Kernel branch to build'
+        required: true
+        type: choice
+        options:
+          - seventeen-ksun-susfs
+          - seventeen
+        default: seventeen-ksun-susfs
+      clang_version:
+        description: 'AOSP Clang version'
+        required: true
+        type: string
+        default: 'r530567'
+      branding:
+        description: 'Kernel branding string'
+        required: false
+        type: string
+        default: '-asteroids-susfs'
+
+jobs:
+  build-kernel:
+    name: Build Kernel (${{ inputs.branch }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: Maximize build disk space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf libelf-dev libssl-dev lz4 make libncurses5-dev \
+            python3 python3-pip rsync tar unzip wget xz-utils zlib1g-dev \
+            dwarves gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Download & Setup AOSP Clang (${{ inputs.clang_version }})
+        run: |
+          CLANG_DIR="${RUNNER_TEMP}/clang"
+          mkdir -p "${CLANG_DIR}"
+          echo "Downloading AOSP Clang ${{ inputs.clang_version }}..."
+          curl -fsSL --retry 3 "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-${{ inputs.clang_version }}.tar.gz" | tar -xz -C "${CLANG_DIR}"
+          echo "${CLANG_DIR}/bin" >> $GITHUB_PATH
+          echo "CLANG_DIR=${CLANG_DIR}" >> $GITHUB_ENV
+
+      - name: Verify Clang Version
+        run: |
+          clang --version
+          ld.lld --version
+
+      - name: Setup ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-kernel-${{ inputs.branch }}-${{ github.sha }}
+          restore-keys: |
+            ccache-kernel-${{ inputs.branch }}-
+            ccache-kernel-
+
+      - name: Configure Kernel
+        run: |
+          export PATH="${CLANG_DIR}/bin:${PATH}"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CC="ccache clang"
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          ccache -M 10G
+          ccache -z
+
+          echo "==> Generating base GKI defconfig..."
+          make O=out gki_defconfig
+
+          echo "==> Merging vendor asteroids_perf.config..."
+          if [ -f "arch/arm64/configs/vendor/asteroids_perf.config" ]; then
+            ./scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/vendor/asteroids_perf.config
+          fi
+
+          if [ -n "${{ inputs.branding }}" ]; then
+            sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ inputs.branding }}\"/" out/.config || echo "CONFIG_LOCALVERSION=\"${{ inputs.branding }}\"" >> out/.config
+          fi
+
+          echo "==> Finalizing olddefconfig..."
+          make O=out olddefconfig
+
+          echo "==> Checking KernelSU / SUSFS config status:"
+          grep -E "CONFIG_KSU|CONFIG_SUSFS" out/.config || echo "No KSU config found in .config"
+
+      - name: Compile Kernel Image
+        run: |
+          export PATH="${CLANG_DIR}/bin:${PATH}"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CC="ccache clang"
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export KBUILD_BUILD_USER=fruitzail
+          export KBUILD_BUILD_HOST=ServerHive
+
+          make -j$(nproc --all) O=out Image
+
+          if [ ! -f "out/arch/arm64/boot/Image" ]; then
+            echo "Error: out/arch/arm64/boot/Image was not created!"
+            exit 1
+          fi
+
+          echo "Kernel compiled successfully!"
+          ls -lh out/arch/arm64/boot/Image
+          ccache -s
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/README.md
+
+          cat << 'ANYKERNEL_EOF' > AnyKernel3/anykernel.sh
+          ### AnyKernel3 Script for Nothing Phone (2a/3a) asteroids
+          properties() { '
+          kernel.string=KernelSU-Next + SUSFS for Nothing Phone (2a/3a)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=asteroids
+          device.name2=Asteroids
+          device.name3=Pacman
+          device.name4=pacman
+          device.name5=PacmanPro
+          device.name6=pacmanpro
+          supported.versions=14, 15, 16, 17
+          supported.patchlevels=
+          '; }
+
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          ANYKERNEL_EOF
+
+          # Clean any leading whitespace inside anykernel.sh
+          sed -i 's/^[ \t]*//' AnyKernel3/anykernel.sh
+
+          cp out/arch/arm64/boot/Image AnyKernel3/Image
+
+          TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
+          ZIP_NAME="AnyKernel3-asteroids-6.6.144-${{ inputs.branch }}-${TIMESTAMP}.zip"
+          cd AnyKernel3
+          zip -r9 "../${ZIP_NAME}" * -x "*placeholder"
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "Package created: ${ZIP_NAME}"
+
+      - name: Upload AnyKernel3 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 14
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="release-${{ inputs.branch }}-$(date +'%Y%m%d%H%M')"
+          gh release create "${TAG_NAME}" "${{ env.ZIP_NAME }}" \
+            --title "KernelSU-Next + SUSFS Kernel (${{ inputs.branch }})" \
+            --notes "Automated AnyKernel3 build for Nothing Phone (2a/3a) asteroids based on branch ${{ inputs.branch }} (6.6.144)." || echo "Release creation optional"
