@@ -19,7 +19,7 @@ on:
           - FinaSU
           - KernelSU-Next
           - None
-        default: FinaSU
+        default: KernelSU-Next
       clang_version:
         description: 'AOSP Clang version'
         required: true
