@@ -4,13 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       branch:
-        description: 'Kernel branch to build'
+        description: 'Kernel base branch'
         required: true
         type: choice
         options:
           - seventeen-ksun-susfs
           - seventeen
         default: seventeen-ksun-susfs
+      root_flavor:
+        description: 'Root & Hide Solution'
+        required: true
+        type: choice
+        options:
+          - FinaSU
+          - KernelSU-Next
+          - None
+        default: FinaSU
       clang_version:
         description: 'AOSP Clang version'
         required: true
@@ -24,7 +33,7 @@ on:
 
 jobs:
   build-kernel:
-    name: Build Kernel (${{ inputs.branch }})
+    name: Build Kernel (${{ inputs.root_flavor }} on ${{ inputs.branch }})
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -51,10 +60,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
-            git gnupg gperf libelf-dev libssl-dev lz4 make libncurses5-dev \
+            bc bison build-essential ccache curl flex \
+            git gnupg gperf libelf-dev libssl-dev lz4 make libncurses-dev \
             python3 python3-pip rsync tar unzip wget xz-utils zlib1g-dev \
-            dwarves gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+            dwarves
 
       - name: Download & Setup AOSP Clang (${{ inputs.clang_version }})
         run: |
@@ -70,13 +79,50 @@ jobs:
           clang --version
           ld.lld --version
 
+      - name: Setup Root Implementation (${{ inputs.root_flavor }})
+        run: |
+          mkdir -p release_artifacts
+          if [ "${{ inputs.root_flavor }}" = "FinaSU" ]; then
+            echo "==> Configuring FinaSU (LyraVoid/FinaSU)..."
+            rm -rf drivers/kernelsu KernelSU-Next FinaSU
+            git clone --depth 1 https://github.com/LyraVoid/FinaSU.git FinaSU
+            ln -sf ../FinaSU/kernel drivers/kernelsu
+
+            # Download matching FinaSU Manager APK
+            echo "==> Fetching latest FinaSU Manager APK..."
+            FINASU_APK_URL=$(curl -s "https://api.github.com/repos/LyraVoid/FinaSU/releases/latest" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+            if [ -n "${FINASU_APK_URL}" ] && [ "${FINASU_APK_URL}" != "null" ]; then
+              wget -q "${FINASU_APK_URL}" -O release_artifacts/FinaSU_Manager.apk || true
+            fi
+          elif [ "${{ inputs.root_flavor }}" = "KernelSU-Next" ]; then
+            echo "==> Configuring KernelSU-Next (pershoot dev-susfs)..."
+            rm -rf drivers/kernelsu KernelSU-Next FinaSU
+            git clone --depth 1 -b dev-susfs https://github.com/pershoot/KernelSU-Next.git KernelSU-Next
+            ln -sf ../KernelSU-Next/kernel drivers/kernelsu
+
+            # Download matching KernelSU-Next Manager APK
+            echo "==> Fetching latest KernelSU-Next Manager APK..."
+            KSUN_APK_URL=$(curl -s "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/releases/latest" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+            if [ -n "${KSUN_APK_URL}" ] && [ "${KSUN_APK_URL}" != "null" ]; then
+              wget -q "${KSUN_APK_URL}" -O release_artifacts/KernelSU_Next_Manager.apk || true
+            fi
+          fi
+
+          # Ensure drivers/Makefile and drivers/Kconfig wire kernelsu
+          if ! grep -q "kernelsu" drivers/Makefile; then
+            printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> drivers/Makefile
+          fi
+          if ! grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig; then
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+
       - name: Setup ccache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: ccache-kernel-${{ inputs.branch }}-${{ github.sha }}
+          key: ccache-kernel-${{ inputs.branch }}-${{ inputs.root_flavor }}-${{ github.sha }}
           restore-keys: |
-            ccache-kernel-${{ inputs.branch }}-
+            ccache-kernel-${{ inputs.branch }}-${{ inputs.root_flavor }}-
             ccache-kernel-
 
       - name: Configure Kernel
@@ -100,6 +146,7 @@ jobs:
             ./scripts/kconfig/merge_config.sh -m -O out out/.config arch/arm64/configs/vendor/asteroids_perf.config
           fi
 
+          # Apply branding string if set
           if [ -n "${{ inputs.branding }}" ]; then
             sed -i "s/CONFIG_LOCALVERSION=.*/CONFIG_LOCALVERSION=\"${{ inputs.branding }}\"/" out/.config || echo "CONFIG_LOCALVERSION=\"${{ inputs.branding }}\"" >> out/.config
           fi
@@ -107,7 +154,7 @@ jobs:
           echo "==> Finalizing olddefconfig..."
           make O=out olddefconfig
 
-          echo "==> Checking KernelSU / SUSFS config status:"
+          echo "==> Root & SUSFS Config Validation:"
           grep -E "CONFIG_KSU|CONFIG_SUSFS" out/.config || echo "No KSU config found in .config"
 
       - name: Compile Kernel Image
@@ -141,7 +188,7 @@ jobs:
           cat << 'ANYKERNEL_EOF' > AnyKernel3/anykernel.sh
           ### AnyKernel3 Script for Nothing Phone (2a/3a) asteroids
           properties() { '
-          kernel.string=KernelSU-Next + SUSFS for Nothing Phone (2a/3a)
+          kernel.string=Asteroids Kernel (6.6.144) + FinaSU/SUSFS
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -168,32 +215,32 @@ jobs:
           flash_boot;
           ANYKERNEL_EOF
 
-          # Clean any leading whitespace inside anykernel.sh
           sed -i 's/^[ \t]*//' AnyKernel3/anykernel.sh
 
           cp out/arch/arm64/boot/Image AnyKernel3/Image
 
           TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
-          ZIP_NAME="AnyKernel3-asteroids-6.6.144-${{ inputs.branch }}-${TIMESTAMP}.zip"
+          ZIP_NAME="AnyKernel3-asteroids-6.6.144-${{ inputs.root_flavor }}-${TIMESTAMP}.zip"
           cd AnyKernel3
           zip -r9 "../${ZIP_NAME}" * -x "*placeholder"
           cd ..
 
+          cp "${ZIP_NAME}" release_artifacts/
           echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
           echo "Package created: ${ZIP_NAME}"
 
-      - name: Upload AnyKernel3 Artifact
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ZIP_NAME }}
-          path: ${{ env.ZIP_NAME }}
+          path: release_artifacts/*
           retention-days: 14
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="release-${{ inputs.branch }}-$(date +'%Y%m%d%H%M')"
-          gh release create "${TAG_NAME}" "${{ env.ZIP_NAME }}" \
-            --title "KernelSU-Next + SUSFS Kernel (${{ inputs.branch }})" \
-            --notes "Automated AnyKernel3 build for Nothing Phone (2a/3a) asteroids based on branch ${{ inputs.branch }} (6.6.144)." || echo "Release creation optional"
+          TAG_NAME="release-${{ inputs.root_flavor }}-$(date +'%Y%m%d%H%M')"
+          gh release create "${TAG_NAME}" release_artifacts/* \
+            --title "Asteroids Kernel 6.6.144 (${{ inputs.root_flavor }} + SUSFS)" \
+            --notes "Automated build for Nothing Phone (2a/3a) asteroids with ${{ inputs.root_flavor }} and SUSFS v2.3+." || echo "Release creation optional"
