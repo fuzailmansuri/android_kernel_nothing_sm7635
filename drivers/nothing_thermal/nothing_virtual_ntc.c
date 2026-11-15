@@ -11,6 +11,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/proc_fs.h>
@@ -39,6 +40,7 @@ enum {
 
 static DEFINE_IDA(virtual_temp_ida);
 static DEFINE_SPINLOCK(sync_temp_lock);
+static DEFINE_MUTEX(virtual_ntc_lock);
 static int virtual_temp[MAX_SIZE];
 
 struct virtual_thermal_trip {
@@ -214,7 +216,7 @@ static int virtual_temp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	result = ida_simple_get(&virtual_temp_ida, 0, 0, GFP_KERNEL);
+	result = ida_simple_get(&virtual_temp_ida, 0, MAX_SIZE, GFP_KERNEL);
 	if (result < 0) {
 		pr_err("genernal stlntc id failed\n");
 		ret = -EINVAL;
@@ -222,6 +224,10 @@ static int virtual_temp_probe(struct platform_device *pdev)
 	}
 
 	hst->id = result;
+	spin_lock_init(&hst->trips_lock);
+	hst->prev_high_trip = INT_MAX;
+	hst->prev_low_trip = -INT_MAX;
+	hst->prev_temp = 0;
 
 	result = build_trips(hst);
 	if(result < 0){
@@ -242,19 +248,17 @@ static int virtual_temp_probe(struct platform_device *pdev)
 	}
 	thermal_zone_device_enable(tz_dev);
 	hst->tzd = tz_dev;
-	hst->prev_high_trip = INT_MAX;
-	hst->prev_low_trip = -INT_MAX;
-	hst->prev_temp = 0;
-	spin_lock_init(&hst->trips_lock);
 
+	mutex_lock(&virtual_ntc_lock);
 	virtual_ntc[hst->id] = hst;
+	mutex_unlock(&virtual_ntc_lock);
 
 	platform_set_drvdata(pdev, hst);
 	return 0;
 err_free_trip:
 	kfree(hst->trips);
 err_remove_id:
-	ida_simple_remove(&virtual_temp_ida, result);
+	ida_simple_remove(&virtual_temp_ida, hst->id);
 err_free_mem:
 	kfree(hst);
 	return ret;
@@ -266,9 +270,13 @@ static int virtual_temp_remove(struct platform_device *pdev)
 
 	if (hst) {
 		platform_set_drvdata(pdev, NULL);
+		mutex_lock(&virtual_ntc_lock);
+		virtual_ntc[hst->id] = NULL;
+		mutex_unlock(&virtual_ntc_lock);
 		thermal_zone_device_unregister(hst->tzd);
 		if(hst->trips)
 			kfree(hst->trips);
+		ida_simple_remove(&virtual_temp_ida, hst->id);
 		kfree(hst);
 	}
 
@@ -328,6 +336,12 @@ static ssize_t attr_store(struct device *dev,
         return count;
     }
 
+    mutex_lock(&virtual_ntc_lock);
+    if (!virtual_ntc[index]) {
+        mutex_unlock(&virtual_ntc_lock);
+        return -ENODEV;
+    }
+
     if (virtual_ntc[index]->trips != NULL) {
         spin_lock_irqsave(&virtual_ntc[index]->trips_lock, flags);
         for (i = 0; i < TRIPS_NUM; i++) {
@@ -367,6 +381,7 @@ static ssize_t attr_store(struct device *dev,
         thermal_zone_device_update(virtual_ntc[index]->tzd, THERMAL_TRIP_VIOLATED);
     }
 
+    mutex_unlock(&virtual_ntc_lock);
     return count;
 }
 
@@ -449,8 +464,8 @@ static void __exit cleanup_virtual_temp(void)
     printk("Cleanup virtual_temp\n");
 	unregister_trace_android_vh_thermal_pm_notify_suspend(tz_is_irq, NULL);
 	tracepoint_synchronize_unregister();
-	platform_driver_unregister(&virtual_temp_platdrv);
     device_remove_file(dev, &dev_attr_data);
+	platform_driver_unregister(&virtual_temp_platdrv);
     device_destroy(virtual_temp_class, MKDEV(100, 0));
     class_destroy(virtual_temp_class);
 }
