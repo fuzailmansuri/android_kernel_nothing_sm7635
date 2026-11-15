@@ -129,6 +129,10 @@ int __write_buf_to_target_partition(struct file *target_partition_file, void *he
 			return 1;
 		}
 	}
+	if (ret != len) {
+		NT_rkl_err_print("Write buf incomplete (%d/%d)\n", ret, len);
+		return 1;
+	}
 	return 0;
 }
 
@@ -275,6 +279,7 @@ void write_back_kernel_boot_log(struct file *target_partition_file) {
 	unsigned int ori_offset = 0;
 	int delta_4K_offset = 0;
 	int final_write = 0;
+	bool dirty = true;
 	size_t len = 0;
 	size_t now_len = 0;
 
@@ -310,6 +315,7 @@ void write_back_kernel_boot_log(struct file *target_partition_file) {
 	kmsg_dump_rewind(&iter);
 	RE_LOOP:
 	while (kmsg_dump_get_line(&iter, true, line_buf, BOOT_LOG_SIZE_OF_LINE, &len)){
+		dirty = true;
 		delta_4K_offset = now_len + len - (NT_PAGE_SIZE );
 		if (delta_4K_offset > 0) {
 			memcpy(buf + now_len, line_buf, len - delta_4K_offset);
@@ -328,9 +334,11 @@ void write_back_kernel_boot_log(struct file *target_partition_file) {
 			now_len += len;
 		}
 	}
-	__write_buf_to_target_partition(target_partition_file, buf, NT_PAGE_SIZE, offset);
+	if (dirty && !__write_buf_to_target_partition(target_partition_file,
+			buf, NT_PAGE_SIZE, offset))
+		dirty = false;
 	msleep_interruptible(PER_LOOP_MS);
-	if(!is_boot_system_server) {
+	if(!READ_ONCE(is_boot_system_server)) {
 		goto RE_LOOP;
 	} else if(!final_write) {
 		NT_rkl_err_print("Boot into system_server,Stop record log!\n");
@@ -366,7 +374,7 @@ int init_reserve_kernel_log_header(struct file *target_partition_file) {
 static ssize_t boot_stage_systemserver_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	return scnprintf(buf, 10, "%d\n", is_boot_system_server);
+	return scnprintf(buf, 10, "%d\n", READ_ONCE(is_boot_system_server));
 }
 
 static ssize_t boot_stage_systemserver_store(struct device *dev,
@@ -384,7 +392,7 @@ static ssize_t boot_stage_systemserver_store(struct device *dev,
 		NT_rkl_err_print("%s input wrang value!\n", __func__);
 		return rc;
 	}
-	is_boot_system_server = value;
+	WRITE_ONCE(is_boot_system_server, value);
 
 	return size;
 }

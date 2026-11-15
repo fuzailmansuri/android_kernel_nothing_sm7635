@@ -41,6 +41,7 @@ const char *buf, size_t count)					\
 
 struct cpu_sync {
 	int		cpu;
+	struct cpufreq_policy *policy;
 	unsigned int	input_boost_min;
 	unsigned int	input_boost_freq;
 };
@@ -93,12 +94,13 @@ static void update_policy_online(void)
 		if (!policy) {
 			pr_err("%s: cpufreq policy not found for cpu%d\n",
 							__func__, i);
-			return;
+			continue;
 		}
 
 		cpumask_andnot(&online_cpus, &online_cpus,
 						policy->related_cpus);
 		boost_adjust_notify(policy);
+		cpufreq_cpu_put(policy);
 	}
 	cpus_read_unlock();
 }
@@ -280,10 +282,12 @@ int input_boost_init(void)
 		s->cpu = cpu;
 		req = &per_cpu(qos_req, cpu);
 		policy = cpufreq_cpu_get(cpu);
+		s->policy = policy;
 		if (!policy) {
 			pr_err("%s: cpufreq policy not found for cpu%d\n",
 							__func__, cpu);
-			return -ESRCH;
+			ret = -ESRCH;
+			goto remove_qos;
 		}
 
 		ret = freq_qos_add_request(&policy->constraints, req,
@@ -291,10 +295,25 @@ int input_boost_init(void)
 		if (ret < 0) {
 			pr_err("%s: Failed to add freq constraint (%d)\n",
 							__func__, ret);
-			return ret;
+			goto remove_qos;
 		}
 	}
 
 	ret = input_register_handler(&inputboost_input_handler);
-	return 0;
+	if (!ret)
+		return 0;
+
+remove_qos:
+	for_each_possible_cpu(cpu) {
+		s = &per_cpu(sync_info, cpu);
+		req = &per_cpu(qos_req, cpu);
+		if (freq_qos_request_active(req))
+			freq_qos_remove_request(req);
+		if (s->policy) {
+			cpufreq_cpu_put(s->policy);
+			s->policy = NULL;
+		}
+	}
+	destroy_workqueue(input_boost_wq);
+	return ret;
 }
