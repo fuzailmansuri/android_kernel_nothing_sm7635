@@ -284,10 +284,22 @@ static void symbol_loader_work(struct work_struct *work)
 #endif
 
 
+static char *q6v5_get_crash_reason(struct qcom_q6v5 *q6v5)
+{
+	size_t len;
+	char *msg;
+
+	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
+	if (IS_ERR(msg) || !len || !msg[0])
+		return NULL;
+
+	/* The remote processor may leave the SMEM item without a terminator. */
+	return kstrndup(msg, len, GFP_KERNEL);
+}
+
 static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
-	size_t len;
 	char *msg;
 
 	int ret;
@@ -304,8 +316,8 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 	}
 
 	q6v5->crash_seq = q6v5->seq;
-	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
-	if (!IS_ERR(msg) && len > 0 && msg[0]) {
+	msg = q6v5_get_crash_reason(q6v5);
+	if (msg) {
 		dev_err(q6v5->dev, "watchdog received: %s\n", msg);
 		trace_rproc_qcom_event(dev_name(q6v5->dev), "q6v5_wdog", msg);
 	} else {
@@ -325,23 +337,25 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
 		schedule_work(&q6v5->crash_handler);
 	else {
 		envp[0] = kasprintf(GFP_KERNEL, "SUBSYS_NAME=%s", dev_name(q6v5->dev));
-		envp[1] = kasprintf(GFP_KERNEL, "CRASH_REASON=%s", msg);
+		envp[1] = kasprintf(GFP_KERNEL, "CRASH_REASON=%s", msg ?: "unknown");
 		envp[2] = NULL;
-		pr_err("fire an uevent for subsys crash! ++ \n");
-		ret = kobject_uevent_env(&q6v5_pdev->dev.kobj, KOBJ_CHANGE, envp);
-		pr_err("fire an uevent for subsys crash! -- %d\n", ret);
+		if (envp[0] && envp[1] && q6v5_pdev) {
+			pr_err("fire an uevent for subsys crash! ++ \n");
+			ret = kobject_uevent_env(&q6v5_pdev->dev.kobj, KOBJ_CHANGE, envp);
+			pr_err("fire an uevent for subsys crash! -- %d\n", ret);
+		}
 		kfree(envp[0]);
 		kfree(envp[1]);
 
 		rproc_report_crash(q6v5->rproc, RPROC_WATCHDOG);
 	}
+	kfree(msg);
 	return IRQ_HANDLED;
 }
 
 static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
 {
 	struct qcom_q6v5 *q6v5 = data;
-	size_t len;
 	char *msg;
 
 	int ret;
@@ -356,8 +370,8 @@ static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
 	}
 
 	q6v5->crash_seq = q6v5->seq;
-	msg = qcom_smem_get(QCOM_SMEM_HOST_ANY, q6v5->crash_reason, &len);
-	if (!IS_ERR(msg) && len > 0 && msg[0]) {
+	msg = q6v5_get_crash_reason(q6v5);
+	if (msg) {
 		dev_err(q6v5->dev, "fatal error received: %s\n", msg);
 		trace_rproc_qcom_event(dev_name(q6v5->dev), "q6v5_fatal", msg);
 	} else {
@@ -385,16 +399,19 @@ static irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
 		schedule_work(&q6v5->crash_handler);
 	else {
 		envp[0] = kasprintf(GFP_KERNEL, "SUBSYS_NAME=%s", dev_name(q6v5->dev));
-		envp[1] = kasprintf(GFP_KERNEL, "CRASH_REASON=%s", msg);
+		envp[1] = kasprintf(GFP_KERNEL, "CRASH_REASON=%s", msg ?: "unknown");
 		envp[2] = NULL;
-		pr_err("fire an uevent for subsys crash! ++ \n");
-		ret = kobject_uevent_env(&q6v5_pdev->dev.kobj, KOBJ_CHANGE, envp);
-		pr_err("fire an uevent for subsys crash! -- %d\n", ret);
+		if (envp[0] && envp[1] && q6v5_pdev) {
+			pr_err("fire an uevent for subsys crash! ++ \n");
+			ret = kobject_uevent_env(&q6v5_pdev->dev.kobj, KOBJ_CHANGE, envp);
+			pr_err("fire an uevent for subsys crash! -- %d\n", ret);
+		}
 		kfree(envp[0]);
 		kfree(envp[1]);
 
 		rproc_report_crash(q6v5->rproc, RPROC_FATAL_ERROR);
 	}
+	kfree(msg);
 	return IRQ_HANDLED;
 }
 

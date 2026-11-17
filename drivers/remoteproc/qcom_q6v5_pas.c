@@ -1909,8 +1909,10 @@ static int adsp_probe(struct platform_device *pdev)
 
 	if (signal_aop) {
 		adsp->qmp = qmp_get(adsp->dev);
-		if (IS_ERR_OR_NULL(adsp->qmp))
+		if (IS_ERR_OR_NULL(adsp->qmp)) {
+			ret = PTR_ERR(adsp->qmp) ?: -ENODEV;
 			goto detach_proxy_pds;
+		}
 	}
 
 	ret = qcom_q6v5_init(&adsp->q6v5, pdev, rproc, desc->crash_reason_smem,
@@ -1982,8 +1984,7 @@ static int adsp_probe(struct platform_device *pdev)
 		ret = ping_subsystem_init(&adsp->q6v5, pdev);
 		if (ret) {
 			dev_err(&pdev->dev, "Unable to find ping/pong bits\n");
-			qcom_remove_sysmon_subdev(adsp->sysmon);
-			return ret;
+			goto destroy_minidump_dev;
 		}
 	}
 
@@ -2025,6 +2026,7 @@ deinit_wakeup_source:
 	dev_pm_clear_wake_irq(adsp->dev);
 	device_init_wakeup(adsp->dev, false);
 detach_proxy_pds:
+	qmp_put(adsp->qmp);
 	adsp_pds_detach(adsp, adsp->proxy_pds, adsp->proxy_pd_count);
 detach_active_pds:
 	adsp_pds_detach(adsp, adsp->active_pds, adsp->active_pd_count);
@@ -2057,6 +2059,7 @@ static int adsp_remove(struct platform_device *pdev)
 	adsp_pds_detach(adsp, adsp->proxy_pds, adsp->proxy_pd_count);
 	dev_pm_clear_wake_irq(adsp->dev);
 	device_init_wakeup(adsp->dev, false);
+	qmp_put(adsp->qmp);
 	rproc_free(adsp->rproc);
 
 	return 0;
