@@ -3665,6 +3665,33 @@ static int spi_geni_levm_suspend_proc(struct spi_geni_master *geni_mas, struct s
 	return 0;
 }
 
+static void spi_geni_restore_active(struct spi_geni_master *geni_mas, bool common_clks)
+{
+	int ret;
+
+	ret = geni_icc_enable(&geni_mas->spi_rsc);
+	if (ret)
+		goto failed;
+	if (common_clks)
+		ret = geni_se_common_clks_on(geni_mas->spi_rsc.clk, geni_mas->m_ahb_clk,
+					geni_mas->s_ahb_clk);
+	else
+		ret = geni_se_resources_on(&geni_mas->spi_rsc);
+	if (ret)
+		goto failed;
+	if (geni_mas->gsi_mode) {
+		ret = spi_geni_gpi_pause_resume(geni_mas, false);
+		if (ret)
+			goto failed;
+	}
+	enable_irq(geni_mas->irq);
+	return;
+
+failed:
+	SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
+		"%s failed to restore active resources: %d\n", __func__, ret);
+}
+
 static int spi_geni_runtime_suspend(struct device *dev)
 {
 	int ret = 0;
@@ -3679,14 +3706,19 @@ static int spi_geni_runtime_suspend(struct device *dev)
 
 	disable_irq(geni_mas->irq);
 	if (geni_mas->is_le_vm) {
-		return spi_geni_levm_suspend_proc(geni_mas, spi, start_time);
+		ret = spi_geni_levm_suspend_proc(geni_mas, spi, start_time);
+		if (ret)
+			enable_irq(geni_mas->irq);
+		return ret;
 	}
 
 	if (geni_mas->gsi_mode) {
 		ret = spi_geni_gpi_pause_resume(geni_mas, true);
 		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev, "%s: finish spi_geni_gpi_pause_resume %d\n", __func__, ret);
-		if (ret)
+		if (ret) {
+			enable_irq(geni_mas->irq);
 			return ret;
+		}
 	}
 
 	/* For tui usecase LA should control clk/gpio/icb */
@@ -3701,21 +3733,33 @@ static int spi_geni_runtime_suspend(struct device *dev)
 		geni_se_common_clks_off(geni_mas->spi_rsc.clk, geni_mas->m_ahb_clk,
 					geni_mas->s_ahb_clk);
 		ret = geni_icc_disable(&geni_mas->spi_rsc);
-		SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev, "%s: %d ---1end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
-		if (ret)
-			SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
+		SPI_LOG_DBG(geni_mas->ipc, true, geni_mas->dev, "%s: %d ---1end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
+		if (ret) {
+			SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
 			"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
+			spi_geni_restore_active(geni_mas, true);
+		}
 		return ret;
 	}
 
 exit_rt_suspend:
 	ret = geni_se_resources_off(&geni_mas->spi_rsc);
+	if (ret) {
+		SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
+			"%s failing at geni_se_resources_off ret=%d\n", __func__, ret);
+		if (geni_mas->gsi_mode)
+			spi_geni_gpi_pause_resume(geni_mas, false);
+		enable_irq(geni_mas->irq);
+		return ret;
+	}
 	ret = geni_icc_disable(&geni_mas->spi_rsc);
-	if (ret)
-		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
+	if (ret) {
+		SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
 		"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
+		spi_geni_restore_active(geni_mas, false);
+	}
 
-	SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev, "%s: %d ---2end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
+	SPI_LOG_DBG(geni_mas->ipc, true, geni_mas->dev, "%s: %d ---2end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
 	geni_capture_stop_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
 			       geni_mas->spi_kpi, start_time, 0, 0);
 	return ret;
@@ -3784,6 +3828,7 @@ static int spi_geni_runtime_resume(struct device *dev)
 			if (ret) {
 				SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
 				"%s dmaengine_resume failed: %d\n", __func__, ret);
+				return ret;
 			}
 			SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
 			"%s: Shared_SE dma_resume call\n", __func__);
@@ -3802,11 +3847,19 @@ static int spi_geni_runtime_resume(struct device *dev)
 		}
 		ret = geni_se_common_clks_on(geni_mas->spi_rsc.clk, geni_mas->m_ahb_clk,
 						geni_mas->s_ahb_clk);
-		if (ret)
+		if (ret) {
 			SPI_LOG_ERR(geni_mas->ipc, false, geni_mas->dev,
 			"%s: Error %d turning on clocks\n", __func__, ret);
+			geni_icc_disable(&geni_mas->spi_rsc);
+			return ret;
+		}
 
 		ret = spi_geni_gpi_pause_resume(geni_mas, false);
+		if (ret) {
+			geni_se_common_clks_off(geni_mas->spi_rsc.clk, geni_mas->m_ahb_clk,
+						geni_mas->s_ahb_clk);
+			geni_icc_disable(&geni_mas->spi_rsc);
+		}
 		return ret;
 	}
 
@@ -3818,6 +3871,12 @@ exit_rt_resume:
 		return ret;
 	}
 	ret = geni_se_resources_on(&geni_mas->spi_rsc);
+	if (ret) {
+		SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
+			"%s failing at geni_se_resources_on ret=%d\n", __func__, ret);
+		geni_icc_disable(&geni_mas->spi_rsc);
+		return ret;
+	}
 
 	geni_write_reg(0x7f, geni_mas->base, GENI_OUTPUT_CTRL);
 	/* Added 10 us delay to settle the write of the register as per HW team recommendation */
@@ -3830,19 +3889,24 @@ exit_rt_resume:
 			SPI_LOG_ERR(geni_mas->ipc, false, geni_mas->dev,
 				    "%s: Error %d deep sleep mas setup\n",
 				    __func__, ret);
-			return ret;
+			goto err_resources;
 		}
 	}
-	if (geni_mas->gsi_mode)
+	if (geni_mas->gsi_mode) {
 		ret = spi_geni_gpi_pause_resume(geni_mas, false);
+		if (ret)
+			goto err_resources;
+	}
 
 	enable_irq(geni_mas->irq);
 
-	if (geni_mas->gsi_mode)
-		ret = spi_geni_gpi_pause_resume(geni_mas, false);
-
 	geni_capture_stop_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
 			       geni_mas->spi_kpi, start_time, 0, 0);
+	return ret;
+
+err_resources:
+	geni_se_resources_off(&geni_mas->spi_rsc);
+	geni_icc_disable(&geni_mas->spi_rsc);
 	return ret;
 }
 
