@@ -1817,7 +1817,12 @@ static int uaudio_qmi_plat_probe(struct platform_device *pdev)
 	}
 
 	ret = register_trace_android_rvh_audio_usb_offload_disconnect(uaudio_disconnect, NULL);
+	if (ret) {
 		dev_err(&pdev->dev, "failed to register disconnect callback ret = %d\n", ret);
+		unregister_trace_android_vh_audio_usb_offload_connect(uaudio_connect, NULL);
+		tracepoint_synchronize_unregister();
+		goto detach_device;
+	}
 
 	return 0;
 
@@ -1828,16 +1833,6 @@ free_domain:
 	return ret;
 }
 
-static int uaudio_qmi_plat_remove(struct platform_device *pdev)
-{
-	unregister_trace_android_vh_audio_usb_offload_connect(uaudio_connect, NULL);
-	iommu_detach_device(uaudio_qdev->domain, &pdev->dev);
-	iommu_domain_free(uaudio_qdev->domain);
-	uaudio_qdev->domain = NULL;
-
-	return 0;
-}
-
 static const struct of_device_id of_uaudio_matach[] = {
 	{
 		.compatible = "qcom,usb-audio-qmi-dev",
@@ -1846,12 +1841,13 @@ static const struct of_device_id of_uaudio_matach[] = {
 };
 MODULE_DEVICE_TABLE(of, of_uaudio_matach);
 
+/* Restricted disconnect hooks require boot-lifetime driver registration. */
 static struct platform_driver uaudio_qmi_driver = {
 	.probe		= uaudio_qmi_plat_probe,
-	.remove		= uaudio_qmi_plat_remove,
 	.driver		= {
 		.name	= "uaudio-qmi",
 		.of_match_table	= of_uaudio_matach,
+		.suppress_bind_attrs = true,
 	},
 };
 
@@ -1912,32 +1908,12 @@ free_svc:
 	return ret;
 }
 
-static void uaudio_qmi_svc_exit(void)
-{
-	struct uaudio_qmi_svc *svc = uaudio_svc;
-
-	qmi_handle_release(svc->uaudio_svc_hdl);
-	flush_workqueue(svc->uaudio_wq);
-	destroy_workqueue(svc->uaudio_wq);
-	kfree(svc->uaudio_svc_hdl);
-	ipc_log_context_destroy(svc->uaudio_ipc_log);
-	kfree(svc);
-	uaudio_svc = NULL;
-}
-
 static int __init uaudio_qmi_plat_init(void)
 {
 	return platform_driver_register(&uaudio_qmi_driver);
 }
 
-static void __exit uaudio_qmi_plat_exit(void)
-{
-	uaudio_qmi_svc_exit();
-	platform_driver_unregister(&uaudio_qmi_driver);
-}
-
 module_init(uaudio_qmi_plat_init);
-module_exit(uaudio_qmi_plat_exit);
 
 MODULE_DESCRIPTION("USB AUDIO QMI Service Driver");
 MODULE_LICENSE("GPL");
