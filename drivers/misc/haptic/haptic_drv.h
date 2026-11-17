@@ -17,10 +17,10 @@
 	pr_err("[ics_haptic]" format, ##__VA_ARGS__)
 
 #define ics_info(format, ...) \
-	pr_err("[ics_haptic]" format, ##__VA_ARGS__)
+	pr_info("[ics_haptic]" format, ##__VA_ARGS__)
 
 #define ics_dbg(format, ...) \
-	pr_err("[ics_haptic]" format, ##__VA_ARGS__)
+	pr_debug("[ics_haptic]" format, ##__VA_ARGS__)
 
 #define check_error_return(ret)	\
 	if (ret < 0) {	\

@@ -250,13 +250,14 @@ static const char *rt6010_get_cmd(void)
 		bootargs = (char *)of_get_property(
 			of_chosen, "bootargs", NULL);
 		if (!bootargs)
-			ics_dbg("%s: failed to get bootargs\n", __func__);
+			ics_err("%s: failed to get bootargs\n", __func__);
 		else {
-			strcpy(__rt6010_cmdline, bootargs);
+			strscpy(__rt6010_cmdline, bootargs, sizeof(__rt6010_cmdline));
 			ics_dbg("%s: bootargs: %s\n", __func__, bootargs);
 		}
 	} else
-		ics_dbg("%s: failed to get /chosen\n", __func__);
+		ics_err("%s: failed to get /chosen\n", __func__);
+	of_node_put(of_chosen);
 
 	return rt6010_cmdline;
 }
@@ -274,7 +275,7 @@ static int rt6010_get_cmdline_f0_data(void)
 	ptr = strstr(rt6010_get_cmd(),"haptic_f0=");
 	if (ptr == NULL)
 	{
-		ics_dbg("%s get null rt6010_get_cmd = %s\n", __func__, rt6010_get_cmd());
+		ics_err("%s get null rt6010_get_cmd = %s\n", __func__, rt6010_get_cmd());
 		return -1;
 	}
 	ics_dbg("%s ptr = %s\n", __func__, ptr);
@@ -1455,7 +1456,7 @@ static int32_t rt6010_get_adc_offset(struct ics_haptic_data *haptic_data)
 
 		if ((adc_value > 60) || (adc_value < -60))
 		{
-			ics_info("ADC offset value error = %d\n", adc_value);
+			ics_err("ADC offset value error = %d\n", adc_value);
 			continue;
 		}
 		adc_value_sum += adc_value;

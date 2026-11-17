@@ -41,7 +41,7 @@ static void richtap_clean_buffer(struct aac_richtap_data *richtap_data, int stat
 	{
 		memset(opbuf->data, 0, RICHTAP_MMAP_BUF_SIZE);
 		opbuf->status = status;
-		opbuf = opbuf->kernel_next;
+		opbuf++;
 	}
 }
 
@@ -49,12 +49,21 @@ static void richtap_update_fifo_data(struct ics_haptic_data *haptic_data, uint32
 {
 	struct aac_richtap_data *richtap_data = (struct aac_richtap_data *)(haptic_data->richtap_data);
 	int32_t samples_left = 0, pos = 0, retry = 3;
+	int32_t length;
 
+	fifo_len = min_t(uint32_t, fifo_len, RICHTAP_RTP_BUF_SIZE);
 	do
 	{
 		if(richtap_data->curr_buf->status == MMAP_BUF_DATA_VALID) 
 		{
-			samples_left = richtap_data->curr_buf->length - richtap_data->pos;
+			length = READ_ONCE(richtap_data->curr_buf->length);
+			if (length < 0 || length > RICHTAP_MMAP_BUF_SIZE ||
+			    richtap_data->pos < 0 || richtap_data->pos > length) {
+				ics_err("invalid mmap length %d, offset %d\n", length, richtap_data->pos);
+				atomic_set(&richtap_data->richtap_stream_mode, false);
+				return;
+			}
+			samples_left = length - richtap_data->pos;
 			if(samples_left < fifo_len)
 			{
 				memcpy(&richtap_data->richtap_ptr[pos], &richtap_data->curr_buf->data[richtap_data->pos], samples_left);
@@ -62,7 +71,10 @@ static void richtap_update_fifo_data(struct ics_haptic_data *haptic_data, uint32
 				fifo_len -= samples_left;
 				richtap_data->curr_buf->status = MMAP_BUF_DATA_INVALID;
 				richtap_data->curr_buf->length = 0;
-				richtap_data->curr_buf = richtap_data->curr_buf->kernel_next;
+				/* The mapped linkage is writable by userspace. */
+				richtap_data->curr_buf =
+					richtap_data->curr_buf == richtap_data->start_buf + RICHTAP_MMAP_BUF_SUM - 1
+					? richtap_data->start_buf : richtap_data->curr_buf + 1;
 				richtap_data->pos = 0;
 			}
 			else
@@ -92,7 +104,9 @@ static void richtap_update_fifo_data(struct ics_haptic_data *haptic_data, uint32
 	} while((fifo_len > 0) && atomic_read(&richtap_data->richtap_stream_mode));
 
 	ics_dbg("update fifo len %d\n", pos);
-	haptic_data->func->set_stream_data(haptic_data, richtap_data->richtap_ptr, pos);
+	if (pos > 0 && haptic_data->func->set_stream_data(haptic_data,
+			richtap_data->richtap_ptr, pos) < 0)
+		atomic_set(&richtap_data->richtap_stream_mode, false);
 }
 
 static void richtap_stream_work_routine(struct work_struct *work)
@@ -100,21 +114,30 @@ static void richtap_stream_work_routine(struct work_struct *work)
 	struct ics_haptic_data *haptic_data = container_of(work, struct ics_haptic_data, richtap_stream_work);
 	struct aac_richtap_data *richtap_data = (struct aac_richtap_data *)(haptic_data->richtap_data);
 	struct mmap_buf_format *opbuf = NULL;
-	uint32_t fifo_size = haptic_data->chip_config.fifo_size;
+	uint32_t fifo_size = min_t(uint32_t, haptic_data->chip_config.fifo_size,
+				   RICHTAP_RTP_BUF_SIZE);
 	uint32_t retry = 30, len = 0;
+	int32_t length;
+	int32_t ret;
 
 	opbuf = richtap_data->start_buf;
 	do
 	{
 		if(opbuf->status == MMAP_BUF_DATA_VALID)
 		{
-			if((len + opbuf->length) <= fifo_size)
+			length = READ_ONCE(opbuf->length);
+			if (length < 0 || length > RICHTAP_MMAP_BUF_SIZE) {
+				ics_err("invalid mmap length %d\n", length);
+				return;
+			}
+			if((len + length) <= fifo_size)
 			{
-				memcpy(&richtap_data->richtap_ptr[len], opbuf->data, opbuf->length);
-				len += opbuf->length;
+				memcpy(&richtap_data->richtap_ptr[len], opbuf->data, length);
+				len += length;
 				opbuf->status = MMAP_BUF_DATA_INVALID;
 				opbuf->length = 0;
-				opbuf = opbuf->kernel_next;
+				opbuf = opbuf == richtap_data->start_buf + RICHTAP_MMAP_BUF_SUM - 1
+					? richtap_data->start_buf : opbuf + 1;
 				richtap_data->pos = 0;
 			}
 			else
@@ -138,12 +161,26 @@ static void richtap_stream_work_routine(struct work_struct *work)
 	while ((retry-- > 0) && (len < fifo_size));
 
 	ics_dbg("stream len = %d, retry = %d, fifo_size = %d\n", len, retry, fifo_size);
+	if (!len)
+		return;
 
-	haptic_data->func->clear_stream_fifo(haptic_data);
-	haptic_data->func->get_irq_state(haptic_data);
-	haptic_data->func->set_play_mode(haptic_data, PLAY_MODE_STREAM);
-	haptic_data->func->play_go(haptic_data);
-	haptic_data->func->set_stream_data(haptic_data, richtap_data->richtap_ptr, len);
+	ret = haptic_data->func->clear_stream_fifo(haptic_data);
+	if (ret < 0)
+		return;
+	ret = haptic_data->func->get_irq_state(haptic_data);
+	if (ret < 0)
+		return;
+	ret = haptic_data->func->set_play_mode(haptic_data, PLAY_MODE_STREAM);
+	if (ret < 0)
+		return;
+	ret = haptic_data->func->play_go(haptic_data);
+	if (ret < 0)
+		return;
+	ret = haptic_data->func->set_stream_data(haptic_data, richtap_data->richtap_ptr, len);
+	if (ret < 0) {
+		haptic_data->func->play_stop(haptic_data);
+		return;
+	}
 	atomic_set(&richtap_data->richtap_stream_mode, true);
 }
 
@@ -180,23 +217,36 @@ static long richtap_file_unlocked_ioctl(struct file *filp, unsigned int cmd, uns
 			}
 			break;
 		case RICHTAP_RTP_MODE:
-			haptic_data->func->play_stop(haptic_data);
+			ret = haptic_data->func->play_stop(haptic_data);
+			if (ret < 0)
+				break;
 			if(copy_from_user(richtap_data->richtap_ptr, (void __user *)arg, RICHTAP_RTP_BUF_SIZE))
 			{
 				ret = -EFAULT;
 				break;
 			}
 			val = *((int32_t*)richtap_data->richtap_ptr);
-			if(val > (RICHTAP_RTP_BUF_SIZE - 4))
+			if(val < 0 || val > (RICHTAP_RTP_BUF_SIZE - 4))
 			{
 				ics_err("%s: invalid data length for rtp mode %d\n", __func__, val);
 				ret = -EINVAL;
 				break;
 			}
-			haptic_data->func->clear_stream_fifo(haptic_data);
-			haptic_data->func->set_play_mode(haptic_data, PLAY_MODE_STREAM);
-			haptic_data->func->play_go(haptic_data);
-			haptic_data->func->set_stream_data(haptic_data, &richtap_data->richtap_ptr[4], val);
+			if (!val)
+				break;
+			ret = haptic_data->func->clear_stream_fifo(haptic_data);
+			if (ret < 0)
+				break;
+			ret = haptic_data->func->set_play_mode(haptic_data, PLAY_MODE_STREAM);
+			if (ret < 0)
+				break;
+			ret = haptic_data->func->play_go(haptic_data);
+			if (ret < 0)
+				break;
+			ret = haptic_data->func->set_stream_data(haptic_data,
+					&richtap_data->richtap_ptr[4], val);
+			if (ret < 0)
+				haptic_data->func->play_stop(haptic_data);
 			break;
 		case RICHTAP_OFF_MODE:
 			break;
@@ -212,7 +262,7 @@ static long richtap_file_unlocked_ioctl(struct file *filp, unsigned int cmd, uns
 			{
 				arg = 0x80;
 			}
-			haptic_data->func->set_gain(haptic_data, (uint32_t)arg);
+			ret = haptic_data->func->set_gain(haptic_data, (uint32_t)arg);
 			break;
 		case RICHTAP_STREAM_MODE:
 			ics_info("%s: richtap ioctl cmd=0x%x, arg=0x%lx\n", __func__, cmd, arg);
@@ -311,18 +361,22 @@ int32_t richtap_misc_register(struct ics_haptic_data *haptic_data)
 		return -ENOMEM;
 	}
 	haptic_data->richtap_data = richtap_data;
+	INIT_WORK(&haptic_data->richtap_stream_work, richtap_stream_work_routine);
 
 	richtap_data->richtap_ptr = devm_kzalloc(&haptic_data->client->dev, RICHTAP_RTP_BUF_SIZE, GFP_KERNEL);
 	if(richtap_data->richtap_ptr == NULL)
 	{
 		ics_err("%s: failed to kmalloc rtp memory failed\n", __func__);
+		ret = -ENOMEM;
 		goto richtap_err;
 	}
 
-	richtap_data->start_buf = (struct mmap_buf_format *)__get_free_pages(GFP_KERNEL, RICHTAP_MMAP_PAGE_ORDER);
+	richtap_data->start_buf = (struct mmap_buf_format *)__get_free_pages(
+			GFP_KERNEL | __GFP_ZERO, RICHTAP_MMAP_PAGE_ORDER);
 	if(richtap_data->start_buf == NULL)
 	{
 		ics_err("%s: Error __get_free_pages failed\n", __func__);
+		ret = -ENOMEM;
 		goto richtap_err;
 	}
 	SetPageReserved(virt_to_page(richtap_data->start_buf));
@@ -337,7 +391,6 @@ int32_t richtap_misc_register(struct ics_haptic_data *haptic_data)
 		}
 		temp->kernel_next = richtap_data->start_buf;
 	}
-	INIT_WORK(&haptic_data->richtap_stream_work, richtap_stream_work_routine);
 
 	richtap_misc_dev.name = haptic_data->richtap_misc_name;
 	ret = misc_register(&richtap_misc_dev);
@@ -363,6 +416,14 @@ int32_t richtap_misc_remove(struct ics_haptic_data *haptic_data)
 	if (richtap_data != NULL)
 	{
 		cancel_work_sync(&haptic_data->richtap_stream_work);
+		atomic_set(&richtap_data->richtap_stream_mode, false);
+		haptic_data->richtap_data = NULL;
+		if (gpio_is_valid(haptic_data->gpio_irq))
+			synchronize_irq(gpio_to_irq(haptic_data->gpio_irq));
+		if (!IS_ERR_OR_NULL(richtap_misc_dev.this_device)) {
+			misc_deregister(&richtap_misc_dev);
+			richtap_misc_dev.this_device = NULL;
+		}
 		if (richtap_data->richtap_ptr != NULL)
 		{
 			devm_kfree(&haptic_data->client->dev, richtap_data->richtap_ptr);
@@ -375,7 +436,6 @@ int32_t richtap_misc_remove(struct ics_haptic_data *haptic_data)
 
 		devm_kfree(&haptic_data->client->dev, richtap_data);
 	}
-	misc_deregister(&richtap_misc_dev);
 	return 0;
 }
 
@@ -384,6 +444,8 @@ int32_t richtap_irq_handler(void *data)
 	struct ics_haptic_data *haptic_data = (struct ics_haptic_data *)data;
 	struct aac_richtap_data *richtap_data = haptic_data->richtap_data;
 	uint32_t available_size = haptic_data->chip_config.fifo_size - haptic_data->chip_config.fifo_ae;
+	if (!richtap_data)
+		return -1;
 
 	if(atomic_read(&richtap_data->richtap_stream_mode))
 	{

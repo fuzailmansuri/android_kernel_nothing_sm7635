@@ -72,7 +72,7 @@ int32_t haptic_hw_reset(struct ics_haptic_data *haptic_data);
 
 	if (byte_count > size)
 	{
-		ics_info("%s source data size is bigger than hex buffer size\n", __func__);
+		ics_err("%s source data size is bigger than hex buffer size\n", __func__);
 		byte_count = size;
 	}
 	for (i = 0; i < byte_count; ++i)
@@ -81,7 +81,7 @@ int32_t haptic_hw_reset(struct ics_haptic_data *haptic_data);
 		ret = kstrtou8(str_u8, 16, &buf[i]);
 		if (ret < 0)
 		{
-			ics_info("%s ics_str2hex data format error\n", __func__);
+			ics_err("%s ics_str2hex data format error\n", __func__);
 			break;
 		}
 	}
@@ -604,7 +604,7 @@ static ssize_t stream_data_store(struct device *dev,
 	size = count;
 	if (size > available)
 	{
-		ics_dbg("stream data size is bigger than stream fifo available size! \
+		ics_err("stream data size is bigger than stream fifo available size! \
 			available=%u, size=%u\n", available, size);
 		size = available;
 	}
@@ -694,7 +694,7 @@ static ssize_t reset_store(struct device *dev,
 	}
 	else
 	{
-		ics_info("hardware reset gpio is NOT valid!\n");
+		ics_err("hardware reset gpio is NOT valid!\n");
 	}
 
 	return count;
@@ -713,7 +713,7 @@ static ssize_t f0_save_show(struct device *dev,
 static ssize_t cali_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
-	ics_info("hardware cali_store NOT valid!\n");
+	ics_err("hardware cali_store NOT valid!\n");
 	return count;
 }
 
@@ -1354,6 +1354,14 @@ static const struct proc_ops haptic_lra_resistance_fops = {
 static int32_t vibrator_init(struct ics_haptic_data *haptic_data)
 {
 	int ret = 0;
+	hrtimer_init(&haptic_data->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	haptic_data->timer.function = vibrator_timer_func;
+	INIT_WORK(&haptic_data->vibrator_work, vibrator_work_routine);
+	INIT_WORK(&haptic_data->preset_work, preset_work_routine);
+	INIT_WORK(&haptic_data->brake_guard_work, brake_guard_work_routine);
+	mutex_init(&haptic_data->lock);
+	mutex_init(&haptic_data->preset_lock);
+	mutex_init(&haptic_data->daq_lock);
 
 #ifdef TIMED_OUTPUT
 	ics_info("%s: TIMED_OUTPUT framework!\n", __func__);
@@ -1392,13 +1400,7 @@ static int32_t vibrator_init(struct ics_haptic_data *haptic_data)
 		return ret;
 	}
 #endif
-	hrtimer_init(&haptic_data->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	haptic_data->timer.function = vibrator_timer_func;
-	INIT_WORK(&haptic_data->vibrator_work, vibrator_work_routine);
-	INIT_WORK(&haptic_data->preset_work, preset_work_routine);
-	mutex_init(&haptic_data->lock);
-	mutex_init(&haptic_data->preset_lock);
-	snprintf(haptic_info, sizeof(haptic_info), haptic_data->richtap_misc_name);
+	strscpy(haptic_info, haptic_data->richtap_misc_name, sizeof(haptic_info));
 	return 0;
 }
 
@@ -1442,11 +1444,16 @@ on_chip_config_err:
 static void chip_init_work_routine(struct work_struct *work)
 {
 	struct ics_haptic_data *haptic_data = container_of(work, struct ics_haptic_data, chip_init_work.work);
+	const struct firmware *config_fw;
+	int ret;
 
 	haptic_data->chip_initialized = false;
-	request_firmware_nowait(THIS_MODULE, FW_ACTION_UEVENT,
-		haptic_config_name, haptic_data->dev, GFP_KERNEL,
-		haptic_data, load_chip_config);
+	ret = request_firmware(&config_fw, haptic_config_name, haptic_data->dev);
+	if (ret < 0) {
+		ics_err("%s: failed to read %s: %d\n", __func__, haptic_config_name, ret);
+		return;
+	}
+	load_chip_config(config_fw, haptic_data);
 }
 
 static void initialize_chip(struct ics_haptic_data *haptic_data)
@@ -1471,7 +1478,7 @@ static int32_t haptic_parse_dt(struct ics_haptic_data *haptic_data)
 	if (haptic_data->gpio_en < 0)
 	{
 		ics_err("%s: no gpio-en provided\n", __func__);
-		return -EPERM;
+		return haptic_data->gpio_en;
 	}
 	else
 	{
@@ -1482,7 +1489,7 @@ static int32_t haptic_parse_dt(struct ics_haptic_data *haptic_data)
 	if (haptic_data->gpio_irq < 0)
 	{
 		ics_err("%s: no gpio-irq provided\n", __func__);
-		return -EPERM;
+		return haptic_data->gpio_irq;
 	}
 	else
 	{
@@ -1496,7 +1503,7 @@ static int32_t haptic_parse_dt(struct ics_haptic_data *haptic_data)
 	}
 	else
 	{
-		memcpy(haptic_data->vib_name, str_val, strlen(str_val));
+		strscpy(haptic_data->vib_name, str_val, sizeof(haptic_data->vib_name));
 		ics_info("provided device name is : %s\n", haptic_data->vib_name);
 	}
 
@@ -1507,7 +1514,8 @@ static int32_t haptic_parse_dt(struct ics_haptic_data *haptic_data)
 	}
 	else
 	{
-		memcpy(haptic_data->richtap_misc_name, str_val, strlen(str_val));
+		strscpy(haptic_data->richtap_misc_name, str_val,
+				sizeof(haptic_data->richtap_misc_name));
 		ics_info("provided richtap name is : %s\n", haptic_data->richtap_misc_name);
 	}
 
@@ -1536,6 +1544,8 @@ static struct regmap_config ics_haptic_regmap =
 static int ics_haptic_probe(struct i2c_client *client, const struct i2c_device_id *id)
 {
 	int32_t ret = 0;
+	bool irq_requested = false, sfdc_registered = false, vibrator_initialized = false;
+	bool vibrator_registered = false;
 	struct ics_haptic_data *haptic_data;
 	struct device* dev = &client->dev;
 
@@ -1577,17 +1587,21 @@ static int ics_haptic_probe(struct i2c_client *client, const struct i2c_device_i
 	// TODO: assign function list according to chip id
 	haptic_data->func = &rt6010_func_list;
 	// enable and irp gpio configuration
-	haptic_parse_dt(haptic_data);
+	ret = haptic_parse_dt(haptic_data);
+	if (ret < 0)
+		goto probe_err;
 	if (gpio_is_valid(haptic_data->gpio_en))
 	{
 		haptic_hw_reset(haptic_data);
 	}
+	vibrator_initialized = true;
 	ret = vibrator_init(haptic_data);
 	if (ret < 0)
 	{
 		ics_err("%s: failed to initialize vibrator interfaces! ret = %d\n", __func__, ret);
 		goto probe_err;
 	}
+	vibrator_registered = true;
 
 	// following initialization steps are not necessary for group broadcast device
 	if (client->addr == 0x5C)
@@ -1614,17 +1628,16 @@ static int ics_haptic_probe(struct i2c_client *client, const struct i2c_device_i
 	if (haptic_data->gp_buf == NULL)
 	{
 		ics_err("%s: failed to allocate memory for gp buffer\n", __func__);
+		ret = -ENOMEM;
 		goto probe_err;
 	}
 	haptic_data->daq_data = kmalloc(MAX_DAQ_BUF_SIZE, GFP_KERNEL);
 	if (haptic_data->daq_data == NULL)
 	{
 		ics_err("%s: failed to allocate memory for daq data buffer\n", __func__);
+		ret = -ENOMEM;
 		goto probe_err;
 	}
-	mutex_init(&haptic_data->daq_lock);
-	initialize_chip(haptic_data);
-	INIT_WORK(&haptic_data->brake_guard_work, brake_guard_work_routine);
 
 	// register irq handler
 	if (gpio_is_valid(haptic_data->gpio_irq))
@@ -1637,6 +1650,7 @@ static int ics_haptic_probe(struct i2c_client *client, const struct i2c_device_i
 			ics_err("%s: failed to request threaded irq! ret = %d\n", __func__, ret);
 			goto probe_err;
 		}
+		irq_requested = true;
 	}
 
 	// initialize sfdc misc device
@@ -1646,6 +1660,7 @@ static int ics_haptic_probe(struct i2c_client *client, const struct i2c_device_i
 		ics_err("%s: failed to register sfdc device! ret = %d\n", __func__, ret);
 		goto probe_err;
 	}
+	sfdc_registered = true;
 
 #ifdef AAC_RICHTAP_SUPPORT
 	ret = richtap_misc_register(haptic_data);
@@ -1666,7 +1681,8 @@ static int ics_haptic_probe(struct i2c_client *client, const struct i2c_device_i
 	haptic_proc_dir =  proc_mkdir("haptic", NULL);
 	if(!haptic_proc_dir){
 		pr_err("haptic proc dir creates failed !!\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto probe_err;
 	}
 	g_haptic_data = haptic_data;
 	proc_create_data("f0", 0664, haptic_proc_dir, &haptic_f0_fops, haptic_data);
@@ -1674,11 +1690,35 @@ static int ics_haptic_probe(struct i2c_client *client, const struct i2c_device_i
 	proc_create_data("gpp", 0664, haptic_proc_dir, &haptic_gpp_fops, haptic_data);
 #endif
 
+	initialize_chip(haptic_data);
 	return 0;
 
 probe_err:
 	if (haptic_data != NULL)
 	{
+	if (irq_requested)
+		devm_free_irq(&client->dev, gpio_to_irq(haptic_data->gpio_irq), haptic_data);
+#ifdef AAC_RICHTAP_SUPPORT
+	if (sfdc_registered)
+		richtap_misc_remove(haptic_data);
+#endif
+	if (sfdc_registered)
+		sfdc_misc_remove(haptic_data);
+	if (vibrator_initialized) {
+		if (vibrator_registered) {
+			sysfs_remove_group(&haptic_data->vib_dev.dev->kobj,
+					&ics_haptic_attribute_group);
+#ifdef TIMED_OUTPUT
+			timed_output_dev_unregister(&haptic_data->vib_dev);
+#else
+			devm_led_classdev_unregister(&client->dev, &haptic_data->vib_dev);
+#endif
+		}
+		hrtimer_cancel(&haptic_data->timer);
+		cancel_work_sync(&haptic_data->preset_work);
+		cancel_work_sync(&haptic_data->vibrator_work);
+		cancel_work_sync(&haptic_data->brake_guard_work);
+	}
 	kfifo_free(&haptic_data->stream_fifo);
 	if (haptic_data->gp_buf != NULL)
 	{
@@ -1690,16 +1730,6 @@ probe_err:
 			kfree(haptic_data->daq_data);
 	}
 
-	devm_free_irq(&client->dev, gpio_to_irq(haptic_data->gpio_irq), haptic_data);
-	if (gpio_is_valid(haptic_data->gpio_en))
-	{
-		//devm_gpio_free(&client->dev, haptic_data->gpio_en);
-		gpio_free(haptic_data->gpio_en);
-	}
-	if (haptic_data != NULL)
-	{
-		devm_kfree(&client->dev, haptic_data);
-	}
 }
 	return ret;
 }
@@ -1707,15 +1737,26 @@ probe_err:
 static int ics_haptic_remove(struct i2c_client *client)
 {
 	struct ics_haptic_data *haptic_data = i2c_get_clientdata(client);
+	sysfs_remove_group(&haptic_data->vib_dev.dev->kobj, &ics_haptic_attribute_group);
+#ifdef TIMED_OUTPUT
+	timed_output_dev_unregister(&haptic_data->vib_dev);
+#else
+	devm_led_classdev_unregister(&client->dev, &haptic_data->vib_dev);
+#endif
+	if (client->addr != 0x5C) {
+		cancel_delayed_work_sync(&haptic_data->chip_init_work);
+		if (gpio_is_valid(haptic_data->gpio_irq))
+			devm_free_irq(&client->dev, gpio_to_irq(haptic_data->gpio_irq), haptic_data);
 
 #ifdef AAC_RICHTAP_SUPPORT
-	richtap_misc_remove(haptic_data);
+		richtap_misc_remove(haptic_data);
 #endif
-	sfdc_misc_remove(haptic_data);
+		sfdc_misc_remove(haptic_data);
+	}
+	hrtimer_cancel(&haptic_data->timer);
 	cancel_work_sync(&haptic_data->preset_work);
 	cancel_work_sync(&haptic_data->vibrator_work);
 	cancel_work_sync(&haptic_data->brake_guard_work);
-	hrtimer_cancel(&haptic_data->timer);
 	mutex_destroy(&haptic_data->lock);
 	mutex_destroy(&haptic_data->preset_lock);
 
@@ -1731,12 +1772,14 @@ static int ics_haptic_remove(struct i2c_client *client)
 		kfree(haptic_data->daq_data);
 	}
 
-	devm_free_irq(&client->dev, gpio_to_irq(haptic_data->gpio_irq), haptic_data);
-	if (gpio_is_valid(haptic_data->gpio_en))
-	{
-		//devm_gpio_free(&client->dev, haptic_data->gpio_en);
-		gpio_free(haptic_data->gpio_en);
+	vfree(haptic_data->waveform_data);
+#if IS_ENABLED(CONFIG_PROC_FS)
+	if (client->addr != 0x5C) {
+		proc_remove(haptic_proc_dir);
+		haptic_proc_dir = NULL;
+		g_haptic_data = NULL;
 	}
+#endif
 
 	return 0;
 }
