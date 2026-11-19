@@ -61,10 +61,15 @@ static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
 
 /************************ Governor internals ***********************/
 
+static bool sugov_should_rate_limit(struct sugov_policy *sg_policy, u64 time)
+{
+	s64 delta_ns = time - sg_policy->last_freq_update_time;
+
+	return delta_ns < sg_policy->freq_update_delay_ns;
+}
+
 static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 {
-	s64 delta_ns;
-
 	/*
 	 * Since cpufreq_update_util() is called with rq->lock held for
 	 * the @target_cpu, our per-CPU data is fully serialized.
@@ -89,9 +94,14 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 		return true;
 	}
 
-	delta_ns = time - sg_policy->last_freq_update_time;
+	/*
+	 * When frequency-invariant utilization tracking is present, there is no
+	 * rate limit when increasing frequency.
+	 */
+	if (arch_scale_freq_invariant())
+		return true;
 
-	return delta_ns >= sg_policy->freq_update_delay_ns;
+	return !sugov_should_rate_limit(sg_policy, time);
 }
 
 static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
@@ -107,13 +117,16 @@ static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 		 * specifically wants that to happen on every update of the
 		 * policy limits.
 		 */
-		if (sg_policy->next_freq == next_freq &&
-		    !cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
-			return false;
-	} else if (sg_policy->next_freq == next_freq) {
-		return false;
+		if (cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
+			goto must_update;
 	}
 
+	if (next_freq == sg_policy->next_freq ||
+	    (next_freq < sg_policy->next_freq &&
+	     sugov_should_rate_limit(sg_policy, time)))
+		return false;
+
+must_update:
 	sg_policy->next_freq = next_freq;
 	sg_policy->last_freq_update_time = time;
 
