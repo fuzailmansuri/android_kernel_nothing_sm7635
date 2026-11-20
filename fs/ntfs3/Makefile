@@ -27,8 +27,7 @@ ntfs3-y :=	attrib.o \
 		run.o \
 		super.o \
 		upcase.o \
-		xattr.o \
-		posix_nacl.o
+		xattr.o
 
 ntfs3-$(CONFIG_NTFS3_LZX_XPRESS) += $(addprefix lib/,\
 		decompress_common.o \

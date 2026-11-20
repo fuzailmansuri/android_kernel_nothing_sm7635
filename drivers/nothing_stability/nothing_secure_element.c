@@ -159,7 +159,9 @@ exit:
 			devm_kfree(dev, secure_data_ptr);
 	}
 
-	return 0;
+	secure_data_ptr = NULL;
+	nothing_secure_dir = NULL;
+	return ret;
 }
 
 static int nothing_secure_element_remove(struct platform_device *secure_dev)

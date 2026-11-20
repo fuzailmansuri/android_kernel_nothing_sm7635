@@ -36,4 +36,3 @@ int touchpanel_event_call_notifier(unsigned long val, void *data)
 EXPORT_SYMBOL_GPL(touchpanel_event_call_notifier);
 
 MODULE_LICENSE("GPL");
-

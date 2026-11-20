@@ -5,7 +5,6 @@
  */
 
 #include <linux/kernel.h>
-#include <linux/capability.h>
 #include <linux/module.h>
 #include <linux/msm_sysstats.h>
 #include <linux/percpu.h>
@@ -20,6 +19,8 @@
 #include <linux/fdtable.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
+
+#include <linux/qcom_dma_heap.h>
 
 struct tgid_iter {
 	unsigned int tgid;
@@ -36,18 +37,6 @@ static const struct nla_policy sysstats_cmd_get_policy[SYSSTATS_CMD_ATTR_MAX + 1
 	[SYSSTATS_TASK_CMD_ATTR_PID]  = { .type = NLA_U32 },
 	[SYSSTATS_TASK_CMD_ATTR_FOREACH]  = { .type = NLA_U32 },
 	[SYSSTATS_TASK_CMD_ATTR_PIDS_OF_NAME] = { .type = NLA_NUL_STRING}};
-
-/* Android perf HALs can hold SYS_ADMIN, but not the networking capability. */
-static bool sysstats_capable(const struct sk_buff *skb)
-{
-	return netlink_capable(skb, CAP_SYS_ADMIN) ||
-	       netlink_capable(skb, CAP_NET_ADMIN);
-}
-
-static int sysstats_dump_start(struct netlink_callback *cb)
-{
-	return sysstats_capable(cb->skb) ? 0 : -EPERM;
-}
 /*
  * The below dummy function is a means to get rid of calling
  * callbacks with out any external sync.
@@ -73,9 +62,6 @@ static int sysstats_pre_doit(const struct genl_ops *ops, struct sk_buff *skb,
 			      struct genl_info *info)
 {
 	const struct nla_policy *policy = NULL;
-
-	if (!sysstats_capable(skb))
-		return -EPERM;
 
 	switch (ops->cmd) {
 	case SYSSTATS_TASK_CMD_GET:
@@ -184,7 +170,7 @@ static int get_dma_info(const void *data, struct file *file, unsigned int n)
 	struct dma_buf *dmabuf;
 	unsigned long *size = (unsigned long *)data;
 
-	if (!is_dma_buf_file(file))
+	if (!qcom_is_dma_buf_file(file))
 		return 0;
 
 	dmabuf = (struct dma_buf *)file->private_data;
@@ -584,7 +570,7 @@ static void sysstats_fill_zoneinfo(struct sysstats_mem *stats)
 	}
 	stats->zram_compressed = K(zspages);
 }
-#else
+#elif
 static void sysstats_fill_zoneinfo(struct sysstats_mem *stats)
 {
 }
@@ -661,19 +647,20 @@ static const struct genl_ops sysstats_ops[] = {
 	{
 		.cmd		= SYSSTATS_TASK_CMD_GET,
 		.validate	= GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.flags		= GENL_ADMIN_PERM,
 		.doit		= sysstats_task_user_cmd,
-		.start		= sysstats_dump_start,
 		.dumpit		= sysstats_task_foreach,
 	},
 	{
 		.cmd		= SYSSTATS_MEMINFO_CMD_GET,
 		.validate	= GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.flags		= GENL_ADMIN_PERM,
 		.doit		= sysstats_meminfo_user_cmd,
 	},
 	{
 		.cmd		= SYSSTATS_PIDS_CMD_GET,
 		.validate	= GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
-		.start		= sysstats_dump_start,
+		.flags		= GENL_ADMIN_PERM,
 		.dumpit		= sysstats_all_pids_of_name,
 	}
 };
@@ -710,5 +697,4 @@ static void __exit sysstats_exit(void)
 module_init(sysstats_init);
 module_exit(sysstats_exit);
 MODULE_IMPORT_NS(MINIDUMP);
-MODULE_IMPORT_NS(DMA_BUF);
 MODULE_LICENSE("GPL v2");

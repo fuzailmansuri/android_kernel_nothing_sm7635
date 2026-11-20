@@ -947,15 +947,29 @@ static void handle_message(struct battery_chg_dev *bcdev, void *data,
 		break;
 #ifdef NT_EDIT
 	case OEM_GET_LOG_BUFFER:
-		pr_err("adsp_to_kernel_log:%s",get_logs_resp_msg->read_buffer);
+		if (len != sizeof(*get_logs_resp_msg)) {
+			pr_err("Incorrect log response length %zu\n", len);
+			break;
+		}
+		pr_err("adsp_to_kernel_log:%.*s", READ_LOG_BUFFER_SIZE_MAX,
+			get_logs_resp_msg->read_buffer);
 		ack_set = true;
 		break;
 	case OEM_GET_REGISTER_BUFFER:
+		if (len != sizeof(*get_registers_resp_msg)) {
+			pr_err("Incorrect register response length %zu\n", len);
+			break;
+		}
 		memcpy(&g_get_registers_resp_msg, get_registers_resp_msg, sizeof(g_get_registers_resp_msg));
-		pr_err("adsp_to_kernel_log:%s",get_registers_resp_msg->read_buffer);
+		pr_err("adsp_to_kernel_log:%.*s", READ_REGISTER_BUFFER_SIZE_MAX,
+			get_registers_resp_msg->read_buffer);
 		ack_set = true;
 		break;
 	case OEM_CHARGE_ABNORMAL:
+		if (len != sizeof(*abnormal_resp_msg)) {
+			pr_err("Incorrect abnormal response length %zu\n", len);
+			break;
+		}
 		bcdev->nt_abnormal_status_val = abnormal_resp_msg->value;
 		schedule_work(&bcdev->nt_update_event);
 		pr_err("nt_abnormal_status_val:%d",bcdev->nt_abnormal_status_val);
@@ -1823,7 +1837,8 @@ static int charge_dump_reg_show(struct seq_file *m, void *v)
 		return rc;
 	}
 	msleep(200);
-	seq_printf(m, "%s\n", g_get_registers_resp_msg.read_buffer);
+	seq_printf(m, "%.*s\n", READ_REGISTER_BUFFER_SIZE_MAX,
+		g_get_registers_resp_msg.read_buffer);
 	memset(&g_get_registers_resp_msg, 0, sizeof(g_get_registers_resp_msg));
 	return 0;
 }
@@ -2757,6 +2772,9 @@ static int battery_chg_callback(void *priv, void *data, size_t len)
 {
 	struct pmic_glink_hdr *hdr = data;
 	struct battery_chg_dev *bcdev = priv;
+
+	if (!bcdev || !data || len < sizeof(*hdr))
+		return -EINVAL;
 
 	pr_debug("owner: %u type: %u opcode: %#x len: %zu\n", hdr->owner,
 		hdr->type, hdr->opcode, len);

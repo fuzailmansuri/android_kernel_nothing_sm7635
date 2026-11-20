@@ -1,5 +1,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/init.h>
 #include <linux/device.h>
 #include <linux/of_gpio.h>
@@ -19,6 +20,7 @@ struct ois_vdd_ctrl_info {
 };
 
 static struct ois_vdd_ctrl_info *ois_vdd_info;
+static DEFINE_MUTEX(ois_vdd_lock);
 
 static int ois_vdd_parse_dt(struct ois_vdd_ctrl_info *ois_vdd_info)
 {
@@ -61,18 +63,10 @@ err_pwr:
 
 int ois_vdd_enable(struct ois_vdd_ctrl_info *ois_vdd_info)
 {
-	int rc = 0;
+	int rc = regulator_enable(ois_vdd_info->ois_vdd);
+	if (rc)
+		dev_err(&ois_vdd_info->pdev->dev, "regulator enable failed rc=%d\n", rc);
 
-	if(!regulator_is_enabled(ois_vdd_info->ois_vdd)){
-		rc = regulator_enable(ois_vdd_info->ois_vdd);
-		if (rc) {
-			dev_err(&ois_vdd_info->pdev->dev,"regulator enable failed rc=%d\n",rc);
-			goto err_reg;
-		}
-	}
-
-	return rc;
-err_reg:
 	return rc;
 }
 
@@ -88,7 +82,15 @@ int ois_vdd_disable(struct ois_vdd_ctrl_info *ois_vdd_info)
 static ssize_t enable_show(struct class *class, struct class_attribute *attr,
                             char *buf)
 {
-	return sprintf(buf, "%d\n",ois_vdd_info->enable);
+	ssize_t ret;
+
+	mutex_lock(&ois_vdd_lock);
+	if (!ois_vdd_info)
+		ret = -ENODEV;
+	else
+		ret = sysfs_emit(buf, "%d\n", ois_vdd_info->enable);
+	mutex_unlock(&ois_vdd_lock);
+	return ret;
 }
 
 static ssize_t enable_store(struct class *class, struct class_attribute *attr,
@@ -104,12 +106,26 @@ static ssize_t enable_store(struct class *class, struct class_attribute *attr,
 	if (val != 0 && val != 1)
 		return -EINVAL;
 
-	ois_vdd_info->enable = val? true:false;
+	mutex_lock(&ois_vdd_lock);
+	if (!ois_vdd_info) {
+		error = -ENODEV;
+		goto out;
+	}
+	if (val == ois_vdd_info->enable) {
+		error = 0;
+		goto out;
+	}
 
-	if (ois_vdd_info->enable)
-		ois_vdd_enable(ois_vdd_info);
+	if (val)
+		error = ois_vdd_enable(ois_vdd_info);
 	else
-		ois_vdd_disable(ois_vdd_info);
+		error = ois_vdd_disable(ois_vdd_info);
+	if (!error)
+		ois_vdd_info->enable = val;
+out:
+	mutex_unlock(&ois_vdd_lock);
+	if (error)
+		return error;
 
 	return count;
 }
@@ -131,30 +147,66 @@ static struct class ois_vdd_class = {
 
 static int ois_vdd_ctrl_probe(struct platform_device *pdev){
 
+	struct ois_vdd_ctrl_info *info;
 	int ret;
 
-	ois_vdd_info = kzalloc(sizeof(struct ois_vdd_ctrl_info), GFP_KERNEL);
-	ois_vdd_info->pdev = pdev;
-	ois_vdd_info->ois_vdd_class = &ois_vdd_class;
+	mutex_lock(&ois_vdd_lock);
+	if (ois_vdd_info) {
+		ret = -EBUSY;
+		goto out;
+	}
+	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	info->pdev = pdev;
+	info->ois_vdd_class = &ois_vdd_class;
 
-	ret = ois_vdd_parse_dt(ois_vdd_info);
-	if(ret){
-		dev_err(&ois_vdd_info->pdev->dev,"ois_vdd_parse_dt failed");
-		goto err;
+	ret = ois_vdd_parse_dt(info);
+	if (ret) {
+		dev_err(&pdev->dev, "ois_vdd_parse_dt failed\n");
+		goto err_free;
 	}
 
+	/* Class attributes can run as soon as class_register publishes them. */
+	ois_vdd_info = info;
 	ret = class_register(&ois_vdd_class);
-	if(ret){
-		dev_err(&ois_vdd_info->pdev->dev,"class_register fail\n");
-		goto err;
+	if (ret) {
+		dev_err(&pdev->dev, "class_register fail\n");
+		ois_vdd_info = NULL;
+		regulator_put(info->ois_vdd);
+		goto err_free;
 	}
 
-	ois_vdd_info->enable = false;
+	platform_set_drvdata(pdev, info);
+	mutex_unlock(&ois_vdd_lock);
+	return 0;
+err_free:
+	kfree(info);
+out:
+	mutex_unlock(&ois_vdd_lock);
+	return ret;
+}
 
-	return ret;
-err:
-	kfree(ois_vdd_info);
-	return ret;
+static int ois_vdd_ctrl_remove(struct platform_device *pdev)
+{
+	struct ois_vdd_ctrl_info *info = platform_get_drvdata(pdev);
+	int ret;
+
+	class_unregister(&ois_vdd_class);
+	mutex_lock(&ois_vdd_lock);
+	ois_vdd_info = NULL;
+	platform_set_drvdata(pdev, NULL);
+	if (info->enable) {
+		ret = ois_vdd_disable(info);
+		if (ret)
+			dev_err(&pdev->dev, "regulator disable failed rc=%d\n", ret);
+	}
+	regulator_put(info->ois_vdd);
+	kfree(info);
+	mutex_unlock(&ois_vdd_lock);
+	return 0;
 }
 
 static const struct of_device_id ois_vdd_ctrl_of_match[] = {
@@ -166,6 +218,7 @@ MODULE_DEVICE_TABLE(of, ois_vdd_ctrl_of_match);
 
 static struct platform_driver ois_vdd_ctrl_driver = {
 	.probe		= ois_vdd_ctrl_probe,
+	.remove		= ois_vdd_ctrl_remove,
 	.driver		= {
 		.name	= "ois_vdd_ctrl",
 		.of_match_table = ois_vdd_ctrl_of_match,
@@ -178,9 +231,7 @@ static int __init ois_vdd_ctrl_init(void)
 
 static void __exit ois_vdd_ctrl_exit(void)
 {
-	class_unregister(&ois_vdd_class);
 	platform_driver_unregister(&ois_vdd_ctrl_driver);
-	kfree(ois_vdd_info);
 }
 
 

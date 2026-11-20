@@ -586,6 +586,7 @@ config LONTIUM_LT7911UXC
 	  framework, and routes stream-state change interrupts (GPIO0)
 	  to a drain-loop work queue that reads video/audio metadata
 	  over the camera CCI bus and notifies userspace via uevents.
+
 config ST21NFC
 	tristate "ST Microelectronics ST21NFC/ST54 NFC Controller Driver"
 	depends on I2C
@@ -646,4 +647,5 @@ source "drivers/misc/pvpanic/Kconfig"
 source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/vd628x/Kconfig"
 source "drivers/misc/haptic/Kconfig"
+source "drivers/misc/haptic_hv/Kconfig"
 endmenu

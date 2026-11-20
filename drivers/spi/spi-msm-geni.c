@@ -25,9 +25,9 @@
 #include <linux/bootmarker_kernel.h>
 
 #define SPI_NUM_CHIPSELECT	(4)
-#define SPI_XFER_TIMEOUT_MS	(1000)
+#define SPI_XFER_TIMEOUT_MS	(250)
 #define SPI_AUTO_SUSPEND_DELAY	(250)
-#define SPI_XFER_TIMEOUT_OFFSET	(500)
+#define SPI_XFER_TIMEOUT_OFFSET	(250)
 #define SPI_SLAVE_SYNC_XFER_TIMEOUT_OFFSET	(50)
 
 /* SPI SE specific registers */
@@ -2108,9 +2108,10 @@ setup_ipc:
 	/* we should avoid reallocation of ipc context during deepsleep */
 	if (!mas->ipc)
 		mas->ipc = ipc_log_context_create(4, dev_name(mas->dev), 0);
-	dev_info(mas->dev, "tx_fifo %d rx_fifo %d tx_width %d\n",
+		/*
+	dev_dbg(mas->dev, "zxzspi tx_fifo %d rx_fifo %d tx_width %d\n",
 		mas->tx_fifo_depth, mas->rx_fifo_depth,
-		mas->tx_fifo_width);
+		mas->tx_fifo_width);*/
 	if (!mas->shared_ee)
 		mas->setup = true;
 
@@ -2280,6 +2281,7 @@ static int spi_geni_unprepare_transfer_hardware(struct spi_master *spi)
 			/* Do this only for non TVM LA usecase */
 			ret = pinctrl_select_state(mas->geni_pinctrl,
 						mas->geni_gpio_sleep);
+			//printk("eph spi master pin set sleep\n");
 		}
 
 		if (ret)
@@ -3675,7 +3677,7 @@ static int spi_geni_runtime_suspend(struct device *dev)
 	start_time = geni_capture_start_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
 					     geni_mas->spi_kpi);
 
-	SPI_LOG_DBG(geni_mas->ipc, true, geni_mas->dev, "%s: %d ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
+	SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev, "%s: %d\n", __func__, ret);
 
 	disable_irq(geni_mas->irq);
 	if (geni_mas->is_le_vm) {
@@ -3684,7 +3686,6 @@ static int spi_geni_runtime_suspend(struct device *dev)
 
 	if (geni_mas->gsi_mode) {
 		ret = spi_geni_gpi_pause_resume(geni_mas, true);
-		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev, "%s: finish spi_geni_gpi_pause_resume %d\n", __func__, ret);
 		if (ret)
 			return ret;
 	}
@@ -3701,7 +3702,6 @@ static int spi_geni_runtime_suspend(struct device *dev)
 		geni_se_common_clks_off(geni_mas->spi_rsc.clk, geni_mas->m_ahb_clk,
 					geni_mas->s_ahb_clk);
 		ret = geni_icc_disable(&geni_mas->spi_rsc);
-		SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev, "%s: %d ---1end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
 		if (ret)
 			SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
 			"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
@@ -3715,7 +3715,6 @@ exit_rt_suspend:
 		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
 		"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
 
-	SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev, "%s: %d ---2end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
 	geni_capture_stop_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
 			       geni_mas->spi_kpi, start_time, 0, 0);
 	return ret;
@@ -3851,9 +3850,7 @@ static int spi_geni_resume(struct device *dev)
 	struct spi_master *spi = get_spi_master(dev);
 	struct spi_geni_master *geni_mas = spi_master_get_devdata(spi);
 
-	mutex_lock(&geni_mas->spi_ssr.ssr_lock);
 	geni_se_ssc_clk_enable(&geni_mas->rsc, true);
-	mutex_unlock(&geni_mas->spi_ssr.ssr_lock);
 	return 0;
 }
 
@@ -3897,19 +3894,16 @@ static int spi_geni_suspend(struct device *dev)
 	start_time = geni_capture_start_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
 					     geni_mas->spi_kpi);
 
-	mutex_lock(&geni_mas->spi_ssr.ssr_lock);
 	if (geni_mas->is_xfer_in_progress) {
 		if (!pm_runtime_status_suspended(dev)) {
 			SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
 				    ":%s: runtime PM is active\n", __func__);
 			ret = -EBUSY;
-			mutex_unlock(&geni_mas->spi_ssr.ssr_lock);
 			return ret;
 		}
 		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
 			    "%s System suspend not allowed while xfer in progress=%d\n",
 			    __func__, ret);
-		mutex_unlock(&geni_mas->spi_ssr.ssr_lock);
 		return -EBUSY;
 	}
 
@@ -3917,12 +3911,10 @@ static int spi_geni_suspend(struct device *dev)
 		if (!pm_runtime_status_suspended(dev)) {
 			SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev,
 				    ":%s: Client managed runtime PM is active\n", __func__);
-			mutex_unlock(&geni_mas->spi_ssr.ssr_lock);
 			return -EBUSY;
 		}
 		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
 			    "%s: System suspend bypassed due to le/la vm\n", __func__);
-		mutex_unlock(&geni_mas->spi_ssr.ssr_lock);
 		return 0;
 	}
 
@@ -3949,7 +3941,6 @@ static int spi_geni_suspend(struct device *dev)
 	geni_se_ssc_clk_enable(&geni_mas->rsc, false);
 	geni_capture_stop_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
 			       geni_mas->spi_kpi, start_time, 0, 0);
-	mutex_unlock(&geni_mas->spi_ssr.ssr_lock);
 	return ret;
 }
 

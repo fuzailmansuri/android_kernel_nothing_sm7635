@@ -52,7 +52,7 @@ static void richtap_update_fifo_data(struct ics_haptic_data *haptic_data, uint32
 
 	do
 	{
-		if(richtap_data->curr_buf->status == MMAP_BUF_DATA_VALID) 
+		if(richtap_data->curr_buf->status == MMAP_BUF_DATA_VALID)
 		{
 			samples_left = richtap_data->curr_buf->length - richtap_data->pos;
 			if(samples_left < fifo_len)
@@ -255,7 +255,7 @@ static int richtap_file_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	if(vma && ((vma->vm_end - vma->vm_start) != (PAGE_SIZE << RICHTAP_MMAP_PAGE_ORDER)))
 		return -ENOMEM;
-#endif 
+#endif
 	phys = virt_to_phys(richtap_data->start_buf);
 
 	ret = remap_pfn_range(vma, vma->vm_start, (phys >> PAGE_SHIFT), (vma->vm_end - vma->vm_start), vma->vm_page_prot);
@@ -311,11 +311,13 @@ int32_t richtap_misc_register(struct ics_haptic_data *haptic_data)
 		return -ENOMEM;
 	}
 	haptic_data->richtap_data = richtap_data;
+	INIT_WORK(&haptic_data->richtap_stream_work, richtap_stream_work_routine);
 
 	richtap_data->richtap_ptr = devm_kzalloc(&haptic_data->client->dev, RICHTAP_RTP_BUF_SIZE, GFP_KERNEL);
 	if(richtap_data->richtap_ptr == NULL)
 	{
 		ics_err("%s: failed to kmalloc rtp memory failed\n", __func__);
+		ret = -ENOMEM;
 		goto richtap_err;
 	}
 
@@ -323,6 +325,7 @@ int32_t richtap_misc_register(struct ics_haptic_data *haptic_data)
 	if(richtap_data->start_buf == NULL)
 	{
 		ics_err("%s: Error __get_free_pages failed\n", __func__);
+		ret = -ENOMEM;
 		goto richtap_err;
 	}
 	SetPageReserved(virt_to_page(richtap_data->start_buf));
@@ -337,7 +340,6 @@ int32_t richtap_misc_register(struct ics_haptic_data *haptic_data)
 		}
 		temp->kernel_next = richtap_data->start_buf;
 	}
-	INIT_WORK(&haptic_data->richtap_stream_work, richtap_stream_work_routine);
 
 	richtap_misc_dev.name = haptic_data->richtap_misc_name;
 	ret = misc_register(&richtap_misc_dev);
@@ -352,7 +354,14 @@ int32_t richtap_misc_register(struct ics_haptic_data *haptic_data)
 	return 0;
 
 richtap_err:
-	richtap_misc_remove(haptic_data);
+	if (richtap_data->start_buf) {
+		ClearPageReserved(virt_to_page(richtap_data->start_buf));
+		free_pages((unsigned long)richtap_data->start_buf, RICHTAP_MMAP_PAGE_ORDER);
+	}
+	if (richtap_data->richtap_ptr)
+		devm_kfree(&haptic_data->client->dev, richtap_data->richtap_ptr);
+	devm_kfree(&haptic_data->client->dev, richtap_data);
+	haptic_data->richtap_data = NULL;
 	return ret;
 }
 
@@ -360,6 +369,7 @@ int32_t richtap_misc_remove(struct ics_haptic_data *haptic_data)
 {
 	struct aac_richtap_data *richtap_data = haptic_data->richtap_data;
 
+	misc_deregister(&richtap_misc_dev);
 	if (richtap_data != NULL)
 	{
 		cancel_work_sync(&haptic_data->richtap_stream_work);
@@ -374,8 +384,8 @@ int32_t richtap_misc_remove(struct ics_haptic_data *haptic_data)
 		}
 
 		devm_kfree(&haptic_data->client->dev, richtap_data);
+		haptic_data->richtap_data = NULL;
 	}
-	misc_deregister(&richtap_misc_dev);
 	return 0;
 }
 

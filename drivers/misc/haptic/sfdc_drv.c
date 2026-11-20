@@ -88,10 +88,14 @@ static struct miscdevice sfdc_misc_dev =
 
 int32_t sfdc_misc_register(struct ics_haptic_data *haptic_data)
 {
+    int ret;
+
     ics_info("%s: start register sfdc misc dev\n", __func__);
     init_waitqueue_head(&wait_queue);
 
-    misc_register(&sfdc_misc_dev);
+    ret = misc_register(&sfdc_misc_dev);
+    if (ret)
+        return ret;
     g_haptic_data = haptic_data;
 
     ics_info("%s: end register sfdc misc dev\n", __func__);
@@ -101,6 +105,7 @@ int32_t sfdc_misc_register(struct ics_haptic_data *haptic_data)
 int32_t sfdc_misc_remove(struct ics_haptic_data *haptic_data)
 {
     misc_deregister(&sfdc_misc_dev);
+    g_haptic_data = NULL;
     return 0;
 }
 

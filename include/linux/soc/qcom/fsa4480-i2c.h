@@ -48,17 +48,17 @@ static inline int fsa4480_unreg_notifier(struct notifier_block *nb,
 
 static inline bool is_dio4482(void)
 {
-	reture false;
+	return false;
 }
 
 static inline int odm_wcd_sleep_before(void)
 {
-	reture 0;
+	return 0;
 }
 
 static inline int odm_wcd_sleep_after(void)
 {
-	reture 0;
+	return 0;
 }
 
 #endif /* CONFIG_QCOM_FSA4480_I2C */

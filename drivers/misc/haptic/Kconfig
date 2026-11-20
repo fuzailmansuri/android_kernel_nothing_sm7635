@@ -16,6 +16,3 @@ config ICS_HAPTIC_DRV_RICHTAP
     bool "Enable Richtap support"
     depends on ICS_HAPTIC_DRV
 	default n
-
-
-

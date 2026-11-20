@@ -1157,18 +1157,6 @@ config QCOM_ADSP_SLEEPMON
 	   detects and logs sleep violations from ADSP subsystem. The driver
 	   uses master stats from ADSP subsystem stored in SMEM.
 
-config NOTHING_POWERINFO_RPMH
-	bool "RPMH move to sysfs"
-	default n
-	help
-		This option move d/qcom_sleep_stats to sys/module/soc_sleep_sleep
-
-config NOTHING_POWERINFO_STANDBY
-	bool "powerinfo standby debug"
-	default n
-	help
-		This option open powerinfo standby debug
-
 config GH_CPUSYS_VM_MEM_ACCESS
         tristate "Qualcomm Technologies, Inc. CPUSYS VM shared mem access driver"
         depends on GH_RM_DRV
@@ -1307,6 +1295,12 @@ config NT_DISPLAY_NOTIFIER
 	  This driver is responsible for notifying clients, such as fingerprint,
 	  interested in display hbm&ui status to decide capture image or not.
 
+config NT_TOUCH_NOTIFIER
+	tristate "TP fod event notifier"
+	help
+	  Enabling this option adds nt TP fod event notifier driver.
+	  This driver is responsible for notifying clients, such as fingerprint.
+
 config RENAME_DEVICES
 	tristate "Rename  block and network device names"
 	depends on VIRTIO_BLK
@@ -1373,11 +1367,5 @@ config QCOM_KERNEL_BASED_RESTORE
 	  Kernel assists in restoring system state after hibernation.
 	  Requires hibernation support in the kernel.
 	  If not sure, say N.
-
-config NT_TOUCH_NOTIFIER
-	tristate "TP fod event notifier"
-	help
-	  Enabling this option adds nt TP fod event notifier driver.
-	  This driver is responsible for notifying clients, such as fingerprint.
 
 endmenu

@@ -739,7 +739,7 @@ static int fsa4480_probe(struct i2c_client *i2c,
 
 	regmap_read(fsa_priv->regmap, FSA4480_DEVICE_ID, &device_id);
 	dev_info(fsa_priv->dev, "%s: usb switch device_id(%d)", __func__, device_id);
-	
+
 	fsa4480_update_reg_defaults(fsa_priv->regmap);
 	devm_regmap_qti_debugfs_register(fsa_priv->dev, fsa_priv->regmap);
 

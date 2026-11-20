@@ -114,6 +114,7 @@ static DECLARE_WAIT_QUEUE_HEAD(aw20036_waitq);
 int ev_happen = 0;
 char ev_code = '0';
 struct aw20036 *g_aw20036;
+static DEFINE_MUTEX(aw20036_device_lock);
 /******************************************************
  *
  * aw20036 i2c write/read
@@ -335,6 +336,8 @@ static void aw20036_update_cfg_array(struct aw20036 *aw20036,
 static int aw20036_cfg_update_array(struct aw20036 *aw20036)
 {
 	pr_info("%s: enter\n", __func__);
+	if (aw20036->effect >= ARRAY_SIZE(aw20036_cfg_array))
+		return -EINVAL;
 
 	aw20036_update_cfg_array(aw20036,
 				 (aw20036_cfg_array[aw20036->effect].p),
@@ -356,6 +359,11 @@ static void aw20036_cfg_loaded(const struct firmware *cont, void *context)
 	if (!cont) {
 		pr_info("%s: failed to read %s\n", __func__,
 			aw20036_cfg_name[aw20036->effect]);
+		release_firmware(cont);
+		return;
+	}
+	if (cont->size % 2) {
+		dev_err(aw20036->dev, "configuration contains an incomplete register pair\n");
 		release_firmware(cont);
 		return;
 	}
@@ -388,6 +396,7 @@ static void aw20036_cfg_loaded(const struct firmware *cont, void *context)
 
 static int aw20036_cfg_update(struct aw20036 *aw20036)
 {
+	const struct firmware *cont;
 	int ret;
 
 	pr_info("%s: enter\n", __func__);
@@ -402,10 +411,11 @@ static int aw20036_cfg_update(struct aw20036 *aw20036)
 		return (-1);
 	}
 
-	return request_firmware_nowait(THIS_MODULE, FW_ACTION_HOTPLUG,
-				       aw20036_cfg_name[aw20036->effect],
-				       aw20036->dev, GFP_KERNEL, aw20036,
-				       aw20036_cfg_loaded);
+	ret = request_firmware(&cont, aw20036_cfg_name[aw20036->effect], aw20036->dev);
+	if (ret)
+		return ret;
+	aw20036_cfg_loaded(cont, aw20036);
+	return 0;
 }
 #endif
 
@@ -1695,8 +1705,6 @@ static int aw20036_init_led_cdev(struct aw20036 *aw20036,
 #else
 	aw20036->operating_mode =1;
 #endif
-	INIT_WORK(&aw20036->lamps_flowing_work, aw20036_lamps_flowing_work);
-	INIT_WORK(&aw20036->brightness_work, aw20036_brightness_work);
 	aw20036->cdev.brightness_set = aw20036_set_brightness;
 	ret = led_classdev_register(aw20036->dev, &aw20036->cdev);
 	if (ret) {
@@ -1787,13 +1795,13 @@ end:
 
 static void aw20036_clean_buf(struct aw20036 * aw20036, int status)
 {
-	struct mmap_buf_format *opbuf = aw20036->start_buf;
-	int i = 0;
+	int i;
 
 	for (i = 0; i < LED_MMAP_BUF_SUM; i++) {
-		memset(opbuf->data, 0, LED_MMAP_BUF_SIZE*2);
+		struct mmap_buf_format *opbuf = &aw20036->start_buf[i];
+
+		memset(opbuf->data, 0, sizeof(opbuf->data));
 		opbuf->status = status;
-		opbuf = opbuf->kernel_next;
 	}
 }
 
@@ -1825,9 +1833,16 @@ static void aw20036_leds_effect_work(struct work_struct *work)
 				flag = 0;
 				pr_info("%s: Restore start_buf to MMAP_BUF_DATA_FINISHED", __func__);
 			}
-			pr_info("%s aw20036->curr_buf->length:%d\n", __func__,  aw20036->curr_buf->length);
+			u16 length = READ_ONCE(aw20036->curr_buf->length);
+
+			if (length > ARRAY_SIZE(aw20036->curr_buf->data) ||
+			    length % ALL_CHANNEL) {
+				dev_err(aw20036->dev, "invalid stream frame length: %u\n", length);
+				break;
+			}
+			pr_info("%s aw20036->curr_buf->length:%u\n", __func__, length);
 			if(aw20036->sec_num == ALL_CHANNEL){
-				for (i = 0; i < aw20036->curr_buf->length; i += ALL_CHANNEL){
+				for (i = 0; i < length; i += ALL_CHANNEL){
 					start = ktime_get();
 					for(j=0; j < ALL_CHANNEL; j++){
 					       num = led_36[j];
@@ -1855,14 +1870,15 @@ static void aw20036_leds_effect_work(struct work_struct *work)
 						break;
 					}
 				}
-				if((aw20036->curr_buf->length < 468) ||(aw20036->stream_mode ==0)){
+				if((length < 468) ||(aw20036->stream_mode ==0)){
 					pr_info("%s break 3\n", __func__);
 					break;
 				}
 			}
 			aw20036->curr_buf->status = MMAP_BUF_DATA_INVALID;
 			aw20036->curr_buf->length = 0;
-			aw20036->curr_buf = aw20036->curr_buf->kernel_next;
+			aw20036->curr_buf = aw20036->start_buf +
+				((aw20036->curr_buf - aw20036->start_buf + 1) % LED_MMAP_BUF_SUM);
 			retry =0;
 		} else if (aw20036->curr_buf->status == MMAP_BUF_DATA_FINISHED) {
 			pr_info("%s break 4\n", __func__);
@@ -1897,6 +1913,8 @@ static int justOpenOnce = 0;
 static int aw20036_open(struct inode *inode, struct file *filp)
 {
 	pr_info("enter\n");
+	if (!READ_ONCE(g_aw20036))
+		return -ENODEV;
 	if (justOpenOnce == 0){
 		justOpenOnce++;
 	}
@@ -1925,7 +1943,11 @@ static ssize_t aw20036_read(struct file *file, char __user *user, size_t size,lo
 	pr_info("%s\n", __func__);
 	if (size != 1)
 		return -EINVAL;
-	wait_event_interruptible(aw20036_waitq, ev_happen);
+	ret = wait_event_interruptible(aw20036_waitq, ev_happen || !READ_ONCE(g_aw20036));
+	if (ret)
+		return ret;
+	if (!READ_ONCE(g_aw20036))
+		return -ENODEV;
 	ret = copy_to_user(user, &ev_code, 1);
 	if ( ret == 0 )
 	{
@@ -1939,41 +1961,34 @@ static ssize_t aw20036_read(struct file *file, char __user *user, size_t size,lo
 }
 static int aw20036_mmap(struct file *filp, struct vm_area_struct *vma)
 {
-	struct aw20036 *aw20036 = g_aw20036;
-	unsigned long phys;
+	struct aw20036 *aw20036;
+	unsigned long address;
+	struct page *page;
 	int ret = 0;
-
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 7, 0)
-	vm_flags_t vm_flags = calc_vm_prot_bits(PROT_READ|PROT_WRITE, 0) |
+	vm_flags_t vm_flags = calc_vm_prot_bits(PROT_READ | PROT_WRITE, 0) |
 			      calc_vm_flag_bits(filp, MAP_SHARED);
 
 	vm_flags |= current->mm->def_flags | VM_MAYREAD | VM_MAYWRITE |
 		    VM_MAYEXEC | VM_SHARED | VM_MAYSHARE;
-
-	if (vma && (pgprot_val(vma->vm_page_prot) !=
-		   pgprot_val(vm_get_page_prot(vm_flags)))) {
-		pr_err("vm_page_prot error!");
+	if (pgprot_val(vma->vm_page_prot) != pgprot_val(vm_get_page_prot(vm_flags)) ||
+	    vma->vm_end - vma->vm_start != (PAGE_SIZE << LED_MMAP_PAGE_ORDER))
 		return -EPERM;
+
+	mutex_lock(&aw20036_device_lock);
+	aw20036 = g_aw20036;
+	if (!aw20036) {
+		ret = -ENODEV;
+		goto out;
 	}
-
-	if (vma && ((vma->vm_end - vma->vm_start) !=
-		   (PAGE_SIZE << LED_MMAP_PAGE_ORDER))) {
-		pr_err("mmap size check err!");
-		return -EPERM;
+	page = virt_to_page(aw20036->start_buf);
+	/* Inserted pages keep mappings alive after the driver's reference is freed. */
+	for (address = vma->vm_start; address < vma->vm_end; address += PAGE_SIZE) {
+		ret = vm_insert_page(vma, address, page++);
+		if (ret)
+			break;
 	}
-#endif
-
-	pr_info("%s\n", __func__);
-
-	phys = virt_to_phys(aw20036->start_buf);
-
-	ret = remap_pfn_range(vma, vma->vm_start, (phys >> PAGE_SHIFT), (vma->vm_end - vma->vm_start), vma->vm_page_prot);
-	if(ret)
-	{
-		dev_err(aw20036->dev, "Error mmap failed\n");
-		return ret;
-	}
-
+out:
+	mutex_unlock(&aw20036_device_lock);
 	return ret;
 }
 
@@ -1983,6 +1998,8 @@ static unsigned int aw20036_poll(struct file *file, poll_table *wait)
 
 	pr_info("%s\n", __func__);
 	poll_wait(file, &aw20036_waitq, wait);
+	if (!READ_ONCE(g_aw20036))
+		return POLLHUP | POLLERR;
 	if(ev_happen == 1)
 	{
 		mask |= POLLIN | POLLRDNORM;
@@ -1992,18 +2009,26 @@ static unsigned int aw20036_poll(struct file *file, poll_table *wait)
 
 long aw20036_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-	struct aw20036 *aw20036 = g_aw20036;
+	struct aw20036 *aw20036;
+	long ret = 0;
 
 	void __user *argp = (void __user *)arg;
 	unsigned char buf;
 	unsigned char data0[4] = {0xFF, 0x04, 0x58, 0x03};/*init for residual image problem*/
 	unsigned char data1[4] = {0xA6, 0x00, 0xA6, 0x00};/*camera fill-in light*/
 
+	mutex_lock(&aw20036_device_lock);
+	aw20036 = g_aw20036;
+	if (!aw20036) {
+		ret = -ENODEV;
+		goto out;
+	}
 	switch(cmd){
 		case LED_STRIPS_STREAM_MODE:
 			pr_info("%s LED_STRIPS_STREAM_MODE\n", __func__);
 			if(copy_from_user(&aw20036->sec_num, argp, 1)){
-				return -EFAULT;
+				ret = -EFAULT;
+				goto out;
 			}
 			pr_info("%s aw20036->sec_num:%d \n", __func__, aw20036->sec_num);
 			aw20036->stream_mode =1;
@@ -2017,14 +2042,16 @@ long aw20036_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		case LED_STRIPS_ALWAYS_ON:
 			pr_info("%s LED_STRIPS_ALWAYS_ON \n", __func__);
 			if(copy_from_user(&aw20036->always_on, argp, 1)){
-				return -EFAULT;
+				ret = -EFAULT;
+				goto out;
 			}
 			pr_info("%s aw20036->always_on:%d \n", __func__, aw20036->always_on);
 			break;
 	      case LED_STRIPS_FREQ_SET:
 			pr_info("%s LED_STRIPS_FREQ_SET \n", __func__);
 			if(copy_from_user(&buf, argp, 1)){
-				return -EFAULT;
+				ret = -EFAULT;
+				goto out;
 			}
 			pr_info("%s %d \n", __func__, buf);
 			aw20036_reg_page_cfg(aw20036, AW20036_REG_PAGE0);
@@ -2038,7 +2065,9 @@ long aw20036_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			pr_info("%s:No match Mode.\n", __func__);
 			break;
 	}
-	return 0;
+out:
+	mutex_unlock(&aw20036_device_lock);
+	return ret;
 }
 
 static const struct file_operations aw20036_ioctl_fops = {
@@ -2065,6 +2094,18 @@ static struct miscdevice led_strips_dev = {
  * i2c driver
  *
  ******************************************************/
+static void aw20036_cancel_work(struct aw20036 *aw20036)
+{
+	WRITE_ONCE(aw20036->stream_mode, 0);
+	WRITE_ONCE(aw20036->vip_notification, 0);
+	cancel_work_sync(&aw20036->brightness_work);
+	cancel_work_sync(&aw20036->lamps_flowing_work);
+	cancel_work_sync(&aw20036->vip_notification_work);
+	cancel_work_sync(&aw20036->leds_effect_work);
+	if (aw20036->leds_workqueue)
+		destroy_workqueue(aw20036->leds_workqueue);
+}
+
 static int aw20036_i2c_probe(struct i2c_client *i2c,
 			     const struct i2c_device_id *id)
 {
@@ -2072,6 +2113,7 @@ static int aw20036_i2c_probe(struct i2c_client *i2c,
 	struct device_node *np = i2c->dev.of_node;
 	int ret;
 	int irq_flags;
+	bool irq_registered = false;
 
 	pr_info("%s: enter\n", __func__);
 
@@ -2090,6 +2132,11 @@ static int aw20036_i2c_probe(struct i2c_client *i2c,
 	i2c_set_clientdata(i2c, aw20036);
 
 	mutex_init(&aw20036->cfg_lock);
+	INIT_WORK(&aw20036->brightness_work, aw20036_brightness_work);
+	INIT_WORK(&aw20036->lamps_flowing_work, aw20036_lamps_flowing_work);
+	INIT_WORK(&aw20036->vip_notification_work, aw20036_vip_notification_work);
+	INIT_WORK(&aw20036->leds_effect_work, aw20036_leds_effect_work);
+	init_completion(&aw20036->completion);
 
 	/* aw20036 rst & int */
 	if (np) {
@@ -2098,7 +2145,7 @@ static int aw20036_i2c_probe(struct i2c_client *i2c,
 			dev_err(&i2c->dev,
 				"%s: failed to parse device tree node\n",
 				__func__);
-			goto err_parse_dt;
+			goto err_cleanup;
 		}
 	} else {
 		aw20036->reset_gpio = -1;
@@ -2111,7 +2158,7 @@ static int aw20036_i2c_probe(struct i2c_client *i2c,
 		if (ret) {
 			dev_err(&i2c->dev, "%s: rst request failed\n",
 				__func__);
-			goto err_gpio_request;
+			goto err_cleanup;
 		}
 	}
 
@@ -2121,7 +2168,7 @@ static int aw20036_i2c_probe(struct i2c_client *i2c,
 		if (ret) {
 			dev_err(&i2c->dev, "%s: int request failed\n",
 				__func__);
-			goto err_gpio_request;
+			goto err_cleanup;
 		}
 	}
 
@@ -2134,96 +2181,70 @@ static int aw20036_i2c_probe(struct i2c_client *i2c,
 	if (ret < 0) {
 		dev_err(&i2c->dev, "%s: aw20036_read_chipid failed ret=%d\n",
 			__func__, ret);
-		goto err_id;
+		goto err_cleanup;
 	}
 
-	/* aw22xxx irq */
+	aw20036->start_buf = (struct mmap_buf_format *)
+		__get_free_pages(GFP_KERNEL | __GFP_COMP, LED_MMAP_PAGE_ORDER);
+	if (!aw20036->start_buf) {
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
+	{
+		unsigned int i;
+
+		for (i = 0; i < LED_MMAP_BUF_SUM; i++) {
+			aw20036->start_buf[i].kernel_next =
+				&aw20036->start_buf[(i + 1) % LED_MMAP_BUF_SUM];
+			aw20036->start_buf[i].bit = i;
+		}
+	}
+	aw20036->leds_workqueue = create_singlethread_workqueue("leds_wq");
+	if (!aw20036->leds_workqueue) {
+		ret = -ENOMEM;
+		goto err_cleanup;
+	}
+
 	if (gpio_is_valid(aw20036->irq_gpio) &&
 	    !(aw20036->flags & AW20036_FLAG_SKIP_INTERRUPTS)) {
-		/* register irq handler */
 		irq_flags = IRQF_TRIGGER_FALLING | IRQF_ONESHOT;
 		ret = devm_request_threaded_irq(&i2c->dev,
-						gpio_to_irq(aw20036->irq_gpio),
-						NULL, aw20036_irq, irq_flags,
-						"aw20036", aw20036);
-		if (ret != 0) {
-			dev_err(&i2c->dev, "%s: failed to request IRQ %d: %d\n",
-				__func__, gpio_to_irq(aw20036->irq_gpio), ret);
-			goto err_irq;
-		}
+				gpio_to_irq(aw20036->irq_gpio), NULL, aw20036_irq,
+				irq_flags, "aw20036", aw20036);
+		if (ret)
+			goto err_cleanup;
+		irq_registered = true;
 	} else {
-		dev_info(&i2c->dev, "%s skipping IRQ registration\n", __func__);
-		/* disable feature support if gpio was invalid */
 		aw20036->flags |= AW20036_FLAG_SKIP_INTERRUPTS;
 	}
 
-	dev_set_drvdata(&i2c->dev, aw20036);
-
-	aw20036_init_led_cdev(aw20036, np);
-	if (ret < 0) {
-		dev_err(&i2c->dev, "%s error creating led class dev\n",
-			__func__);
-		goto err_sysfs;
-	}
-
-	aw20036->start_buf = (struct mmap_buf_format *)__get_free_pages(GFP_KERNEL, LED_MMAP_PAGE_ORDER);
-	if(aw20036->start_buf == NULL) {
-		dev_err(&i2c->dev, "Error __get_free_pages failed\n");
-	}
-	SetPageReserved(virt_to_page(aw20036->start_buf));
-	{
-		struct mmap_buf_format *temp;
-		uint32_t i = 0;
-		temp = aw20036->start_buf;
-		for ( i = 1; i <LED_MMAP_BUF_SUM; i++)
-		{
-			temp->kernel_next = (aw20036->start_buf + i);
-			temp = temp->kernel_next;
-		}
-		temp->kernel_next = aw20036->start_buf;
-
-		temp = aw20036->start_buf ;
-		for (i = 0; i < LED_MMAP_BUF_SUM; i++) {
-			temp->bit = i;
-			temp = temp->kernel_next;
-		}
-	}
-
-	pr_info("%s leds_workqueue\n", __func__);
-	aw20036->leds_workqueue = create_singlethread_workqueue("leds_wq");
-	if (!aw20036->leds_workqueue) {
-			dev_err(&i2c->dev, "%s create leds workqueue fail\n", __func__);
-	}else{
-		pr_info("%s creat work\n", __func__);
-		INIT_WORK(&aw20036->vip_notification_work, aw20036_vip_notification_work);
-		INIT_WORK(&aw20036->leds_effect_work, aw20036_leds_effect_work);
-	}
-
-	init_completion(&aw20036->completion);
-
+	ret = aw20036_init_led_cdev(aw20036, np);
+	if (ret)
+		goto err_cleanup;
 	ret = misc_register(&led_strips_dev);
-	if (ret) {
-		dev_err(&i2c->dev, "%s: misc_register failed\n", __func__);
-	}
+	if (ret)
+		goto err_remove_led;
+	ret = device_init_wakeup(aw20036->dev, true);
+	if (ret)
+		goto err_remove_misc;
+	mutex_lock(&aw20036_device_lock);
 	g_aw20036 = aw20036;
-
-	aw20036->handset_mode = 0;
-
-	pr_info("%s device_init_wakeup\n", __func__);
-	device_init_wakeup(aw20036->dev, true);
-	pr_info("%s probe completed successfully!\n", __func__);
+	mutex_unlock(&aw20036_device_lock);
 	return 0;
 
- err_sysfs:
-	devm_free_irq(&i2c->dev, gpio_to_irq(aw20036->irq_gpio), aw20036);
- err_irq:
- err_id:
-	gpio_free(aw20036->reset_gpio);
-	gpio_free(aw20036->irq_gpio);
- err_gpio_request:
- err_parse_dt:
-	devm_kfree(&i2c->dev, aw20036);
-	aw20036 = NULL;
+err_remove_misc:
+	misc_deregister(&led_strips_dev);
+err_remove_led:
+	sysfs_remove_group(&aw20036->cdev.dev->kobj, &aw20036_attribute_group);
+	led_classdev_unregister(&aw20036->cdev);
+err_cleanup:
+	if (irq_registered)
+		devm_free_irq(&i2c->dev, gpio_to_irq(aw20036->irq_gpio), aw20036);
+	aw20036_cancel_work(aw20036);
+	if (aw20036->start_buf)
+		free_pages((unsigned long)aw20036->start_buf, LED_MMAP_PAGE_ORDER);
+	mutex_destroy(&aw20036->cfg_lock);
+	i2c_set_clientdata(i2c, NULL);
 	return ret;
 }
 
@@ -2231,19 +2252,21 @@ static void aw20036_i2c_remove(struct i2c_client *i2c)
 {
 	struct aw20036 *aw20036 = i2c_get_clientdata(i2c);
 
-	pr_info("%s enter\n", __func__);
+	mutex_lock(&aw20036_device_lock);
+	if (g_aw20036 == aw20036)
+		g_aw20036 = NULL;
+	mutex_unlock(&aw20036_device_lock);
+	wake_up_interruptible(&aw20036_waitq);
+	misc_deregister(&led_strips_dev);
 	sysfs_remove_group(&aw20036->cdev.dev->kobj, &aw20036_attribute_group);
 	led_classdev_unregister(&aw20036->cdev);
-
-	devm_free_irq(&i2c->dev, gpio_to_irq(aw20036->irq_gpio), aw20036);
-
-	if (gpio_is_valid(aw20036->reset_gpio))
-		gpio_free(aw20036->reset_gpio);
-	if (gpio_is_valid(aw20036->irq_gpio))
-		gpio_free(aw20036->irq_gpio);
-
-	devm_kfree(&i2c->dev, aw20036);
-	aw20036 = NULL;
+	if (!(aw20036->flags & AW20036_FLAG_SKIP_INTERRUPTS))
+		devm_free_irq(&i2c->dev, gpio_to_irq(aw20036->irq_gpio), aw20036);
+	aw20036_cancel_work(aw20036);
+	free_pages((unsigned long)aw20036->start_buf, LED_MMAP_PAGE_ORDER);
+	device_init_wakeup(aw20036->dev, false);
+	mutex_destroy(&aw20036->cfg_lock);
+	i2c_set_clientdata(i2c, NULL);
 }
 
 #define POWER_SUSPEND

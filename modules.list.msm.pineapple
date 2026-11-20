@@ -111,7 +111,3 @@ cqhci.ko
 crm.ko
 bcl_pmic5.ko
 qcom-dload-mode.ko
-nothing_writeback_kmsg.ko
-nothing_error_report.ko
-nothing_secure_element.ko
-nothing_virtual_ntc.ko

@@ -399,7 +399,7 @@ static int rt6010_private_init(
 static int32_t rt6010_parse_dt(struct ics_haptic_data *haptic_data)
 {
 	struct device_node *dev_node = haptic_data->dev->of_node;
-	if (NULL == dev_node) 
+	if (NULL == dev_node)
 	{
 		ics_err("%s: DT node is not valid!\n", __func__);
 		return -EINVAL;

@@ -11,6 +11,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/proc_fs.h>
@@ -39,6 +40,7 @@ enum {
 
 static DEFINE_IDA(virtual_temp_ida);
 static DEFINE_SPINLOCK(sync_temp_lock);
+static DEFINE_MUTEX(virtual_ntc_lock);
 static int virtual_temp[MAX_SIZE];
 
 struct virtual_thermal_trip {
@@ -78,7 +80,7 @@ static int get_temp(struct thermal_zone_device *tz,
 		return -EINVAL;
 
 	hst = tz->devdata;
-	*temp = virtual_temp[hst->id];
+	*temp = READ_ONCE(virtual_temp[hst->id]);
 	return 0;
 }
 
@@ -103,7 +105,7 @@ static int get_trip_temp(struct thermal_zone_device *tz, int trip,
 	if (trip >= hst->ntrips || trip < 0)
 		return -EDOM;
 
-	*temp = hst->trips[trip].temperature;
+	*temp = READ_ONCE(hst->trips[trip].temperature);
 
 	return 0;
 }
@@ -134,7 +136,7 @@ static int get_trip_hyst(struct thermal_zone_device *tz, int trip,
 	if (trip >= hst->ntrips || trip < 0)
 		return -EDOM;
 
-	*hyst = hst->trips[trip].hysteresis;
+	*hyst = READ_ONCE(hst->trips[trip].hysteresis);
 	return 0;
 }
 
@@ -201,7 +203,7 @@ static int virtual_temp_probe(struct platform_device *pdev)
 	struct virtual_temp *hst;
 	int ret = 0;
 	int mask = 0;
-	int result, i;
+	int i;
 
 	if (!of_device_is_available(dev_node)) {
 		pr_err("virtual-temp dev not found\n");
@@ -214,19 +216,20 @@ static int virtual_temp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	result = ida_simple_get(&virtual_temp_ida, 0, 0, GFP_KERNEL);
-	if (result < 0) {
+	ret = ida_alloc_range(&virtual_temp_ida, 0, MAX_SIZE - 1, GFP_KERNEL);
+	if (ret < 0) {
 		pr_err("genernal stlntc id failed\n");
-		ret = -EINVAL;
 		goto err_free_mem;
 	}
 
-	hst->id = result;
+	hst->id = ret;
+	hst->prev_high_trip = INT_MAX;
+	hst->prev_low_trip = -INT_MAX;
+	spin_lock_init(&hst->trips_lock);
 
-	result = build_trips(hst);
-	if(result < 0){
+	ret = build_trips(hst);
+	if (ret < 0) {
 		pr_err("build_trips failed\n");
-		ret = -EINVAL;
 		goto err_remove_id;
 	}
 
@@ -235,29 +238,28 @@ static int virtual_temp_probe(struct platform_device *pdev)
 
 	tz_dev = thermal_zone_device_register(dev_node->name,
 			hst->ntrips, mask, hst, &virtual_thermal_zone_ops, NULL, 0, 0);
-	if (IS_ERR_OR_NULL(tz_dev)) {
+	if (IS_ERR(tz_dev)) {
 		pr_err("register thermal zone for virtual temp failed\n");
-		ret = -ENODEV;
+		ret = PTR_ERR(tz_dev);
 		goto err_free_trip;
 	}
-	thermal_zone_device_enable(tz_dev);
 	hst->tzd = tz_dev;
-	hst->prev_high_trip = INT_MAX;
-	hst->prev_low_trip = -INT_MAX;
-	hst->prev_temp = 0;
-	spin_lock_init(&hst->trips_lock);
+	ret = thermal_zone_device_enable(tz_dev);
+	if (ret)
+		goto err_unregister_zone;
 
+	mutex_lock(&virtual_ntc_lock);
 	virtual_ntc[hst->id] = hst;
-
 	platform_set_drvdata(pdev, hst);
-
-    register_trace_android_vh_thermal_pm_notify_suspend(tz_is_irq, NULL);
+	mutex_unlock(&virtual_ntc_lock);
 
 	return 0;
+err_unregister_zone:
+	thermal_zone_device_unregister(tz_dev);
 err_free_trip:
 	kfree(hst->trips);
 err_remove_id:
-	ida_simple_remove(&virtual_temp_ida, result);
+	ida_free(&virtual_temp_ida, hst->id);
 err_free_mem:
 	kfree(hst);
 	return ret;
@@ -266,12 +268,19 @@ err_free_mem:
 static int virtual_temp_remove(struct platform_device *pdev)
 {
 	struct virtual_temp *hst = platform_get_drvdata(pdev);
+	unsigned long flags;
 
 	if (hst) {
+		mutex_lock(&virtual_ntc_lock);
+		virtual_ntc[hst->id] = NULL;
 		platform_set_drvdata(pdev, NULL);
+		spin_lock_irqsave(&sync_temp_lock, flags);
+		virtual_temp[hst->id] = 0;
+		spin_unlock_irqrestore(&sync_temp_lock, flags);
+		mutex_unlock(&virtual_ntc_lock);
 		thermal_zone_device_unregister(hst->tzd);
-		if(hst->trips)
-			kfree(hst->trips);
+		ida_free(&virtual_temp_ida, hst->id);
+		kfree(hst->trips);
 		kfree(hst);
 	}
 
@@ -297,6 +306,7 @@ static ssize_t attr_store(struct device *dev,
     int low = -INT_MAX;
     int high = INT_MAX;
     unsigned int index = 0;
+    struct virtual_temp *hst;
     char tmp[BUF_LEN + 1];
     unsigned long flags;
     bool is_trigger = false;
@@ -320,24 +330,32 @@ static ssize_t attr_store(struct device *dev,
         tmp[len] = '\0';
     }
 
-    ret = sscanf(tmp, "%d %d", &index, &temp);
+    ret = sscanf(tmp, "%u %d", &index, &temp);
     if (ret < 2) {
         pr_err("store failed, ret=%d\n", ret);
-        return count;
+        return -EINVAL;
     }
 
     if (index >= MAX_SIZE) {
         pr_err("store invalid params\n");
-        return count;
+        return -EINVAL;
     }
 
-    if (virtual_ntc[index]->trips != NULL) {
-        spin_lock_irqsave(&virtual_ntc[index]->trips_lock, flags);
-        for (i = 0; i < TRIPS_NUM; i++) {
-            int trip_low, trip_high;
+    mutex_lock(&virtual_ntc_lock);
+    hst = virtual_ntc[index];
+    if (!hst) {
+        mutex_unlock(&virtual_ntc_lock);
+        return -ENODEV;
+    }
 
-            trip_low = virtual_ntc[index]->trips[i].temperature - virtual_ntc[index]->trips[i].hysteresis;
-            trip_high = virtual_ntc[index]->trips[i].temperature;
+    if (hst->trips != NULL) {
+        spin_lock_irqsave(&hst->trips_lock, flags);
+        for (i = 0; i < TRIPS_NUM; i++) {
+            s64 trip_low;
+            int trip_high;
+
+            trip_low = (s64)hst->trips[i].temperature - hst->trips[i].hysteresis;
+            trip_high = hst->trips[i].temperature;
 
             if (trip_low < temp && trip_low > low)
                 low = trip_low;
@@ -346,29 +364,30 @@ static ssize_t attr_store(struct device *dev,
                 high = trip_high;
         }
 
-        if (temp >= virtual_ntc[index]->prev_high_trip || temp <= virtual_ntc[index]->prev_low_trip) {
-            pr_info("trigger! virtual_ntc[%d]: prev_low_trip = %d, prev_high_trip = %d\n", index, virtual_ntc[index]->prev_low_trip, virtual_ntc[index]->prev_high_trip);
-            pr_info("virtual_ntc[%d]: trip_low = %d, trip_high = %d, temp = %d\n", index, low, high, temp);
+        if (temp >= hst->prev_high_trip || temp <= hst->prev_low_trip) {
+            pr_info("trigger! virtual_ntc[%u]: prev_low_trip = %d, prev_high_trip = %d\n", index, hst->prev_low_trip, hst->prev_high_trip);
+            pr_info("virtual_ntc[%u]: trip_low = %d, trip_high = %d, temp = %d\n", index, low, high, temp);
             is_trigger = true;
         }
 
-        virtual_ntc[index]->prev_low_trip = low;
-        virtual_ntc[index]->prev_high_trip = high;
+        hst->prev_low_trip = low;
+        hst->prev_high_trip = high;
 
-        spin_unlock_irqrestore(&virtual_ntc[index]->trips_lock, flags);
+        spin_unlock_irqrestore(&hst->trips_lock, flags);
     }
 
-    if (abs(virtual_ntc[index]->prev_temp - temp) >= 1000)
+    if (abs((s64)hst->prev_temp - temp) >= 1000)
         is_trigger = true;
 
     spin_lock_irqsave(&sync_temp_lock, flags);
     virtual_temp[index] = temp;
     spin_unlock_irqrestore(&sync_temp_lock, flags);
-    virtual_ntc[index]->prev_temp = temp;
+    hst->prev_temp = temp;
 
-    if (is_trigger && virtual_ntc[index]->tzd != NULL) {
-        thermal_zone_device_update(virtual_ntc[index]->tzd, THERMAL_TRIP_VIOLATED);
+    if (is_trigger) {
+        thermal_zone_device_update(hst->tzd, THERMAL_TRIP_VIOLATED);
     }
+    mutex_unlock(&virtual_ntc_lock);
 
     return count;
 }
@@ -414,27 +433,43 @@ static int __init init_virtual_temp(void)
     if (IS_ERR(dev)) {
         ret = PTR_ERR(dev);
         printk(KERN_ALERT "Failed to create device\n");
-        return ret;
+        goto err_destroy_class;
     }
 
     ret = device_create_file(dev, &dev_attr_data);
     if (ret < 0) {
         printk(KERN_ALERT "Failed to create attribute file.\n");
-        return ret;
+        goto err_destroy_device;
     }
 
-	spin_lock_init(&sync_temp_lock);
+	ret = register_trace_android_vh_thermal_pm_notify_suspend(tz_is_irq, NULL);
+	if (ret)
+		goto err_remove_file;
 
-	return platform_driver_register(&virtual_temp_platdrv);
+	ret = platform_driver_register(&virtual_temp_platdrv);
+	if (!ret)
+		return 0;
+	unregister_trace_android_vh_thermal_pm_notify_suspend(tz_is_irq, NULL);
+	tracepoint_synchronize_unregister();
+err_remove_file:
+	device_remove_file(dev, &dev_attr_data);
+err_destroy_device:
+	device_destroy(virtual_temp_class, MKDEV(100, 0));
+err_destroy_class:
+	class_destroy(virtual_temp_class);
+	return ret;
 }
 
 static void __exit cleanup_virtual_temp(void)
 {
     printk("Cleanup virtual_temp\n");
-	platform_driver_unregister(&virtual_temp_platdrv);
     device_remove_file(dev, &dev_attr_data);
+	platform_driver_unregister(&virtual_temp_platdrv);
+	unregister_trace_android_vh_thermal_pm_notify_suspend(tz_is_irq, NULL);
+	tracepoint_synchronize_unregister();
     device_destroy(virtual_temp_class, MKDEV(100, 0));
     class_destroy(virtual_temp_class);
+	ida_destroy(&virtual_temp_ida);
 }
 
 
