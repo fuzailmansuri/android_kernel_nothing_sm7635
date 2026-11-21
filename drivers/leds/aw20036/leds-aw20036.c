@@ -85,7 +85,7 @@ AW20036_CFG aw20036_cfg_array[] = {
 #define POWER_SAVE_MODE
 
 static char hw_ver[4] = "DVT";
-static char dev_color[6] = "WHITE";
+static char dev_color[7] = "WHITE";
 
 #define AW20036_IMAX_NAME_MAX       32
 static char aw20036_imax_name[][AW20036_IMAX_NAME_MAX] = {
@@ -1254,7 +1254,7 @@ static ssize_t aw20036_dev_color_store(struct device *dev,
 
 	pr_info("%s %s %zu\n", __func__, buf, len);
 
-	if(len > sizeof(dev_color)){
+	if(len >= sizeof(dev_color)){
 		pr_info("%s: invalid hwid \n", __func__);
 		return len;
 	}
