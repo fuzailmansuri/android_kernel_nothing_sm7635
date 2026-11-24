@@ -198,6 +198,7 @@ static long richtap_file_unlocked_ioctl(struct file *filp, unsigned int cmd, uns
 			haptic_data->func->play_go(haptic_data);
 			haptic_data->func->set_stream_data(haptic_data, &richtap_data->richtap_ptr[4], val);
 			break;
+		case RICHTAP_SET_FREQ:
 		case RICHTAP_OFF_MODE:
 			break;
 		case RICHTAP_GET_F0:

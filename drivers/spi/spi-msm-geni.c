@@ -3701,7 +3701,7 @@ static int spi_geni_runtime_suspend(struct device *dev)
 		geni_se_common_clks_off(geni_mas->spi_rsc.clk, geni_mas->m_ahb_clk,
 					geni_mas->s_ahb_clk);
 		ret = geni_icc_disable(&geni_mas->spi_rsc);
-		SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev, "%s: %d ---1end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
+		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev, "%s: %d ---1end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
 		if (ret)
 			SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
 			"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
@@ -3715,7 +3715,7 @@ exit_rt_suspend:
 		SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev,
 		"%s failing at geni_icc_disable ret=%d\n", __func__, ret);
 
-	SPI_LOG_ERR(geni_mas->ipc, true, geni_mas->dev, "%s: %d ---2end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
+	SPI_LOG_DBG(geni_mas->ipc, false, geni_mas->dev, "%s: %d ---2end ctlr->queue = %d ctlr->busy = %d ctlr->running = %d\n", __func__, ret, list_empty(&spi->queue),spi->busy,spi->running);
 	geni_capture_stop_time(&geni_mas->spi_rsc, geni_mas->ipc_log_kpi, __func__,
 			       geni_mas->spi_kpi, start_time, 0, 0);
 	return ret;
