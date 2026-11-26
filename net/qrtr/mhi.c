@@ -173,8 +173,8 @@ static int qcom_mhi_qrtr_probe(struct mhi_device *mhi_dev,
 	/* start channels */
 	rc = mhi_prepare_for_transfer(mhi_dev);
 	if (rc)
-		return rc;
-	}
+		goto err_unregister;
+
 	complete_all(&qdev->prepared);
 
 	dev_dbg(qdev->dev, "Qualcomm MHI QRTR driver probed\n");
@@ -183,8 +183,6 @@ static int qcom_mhi_qrtr_probe(struct mhi_device *mhi_dev,
 
 err_unregister:
 	qrtr_endpoint_unregister(&qdev->ep);
-err_unprepare:
-	mhi_unprepare_from_transfer(mhi_dev);
 
 	return rc;
 }
